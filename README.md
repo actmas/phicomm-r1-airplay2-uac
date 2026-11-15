@@ -2,7 +2,7 @@
 
 **简体中文** | [English](README.en.md)
 
-为**斐讯 R1 智能音箱（Rockchip RK3229 / Android 5.1 / Linux 3.10）**打造的一体化开源固件增强方案：无需拆机换系统，通过极轻量底层 Hook 与内核模块实现 **AirPlay 2 无线无损流媒体**、**USB 有线免驱声卡（UAC1）** 以及 **内核级 SELinux 穿透（Root 持久化）**，并 100% 保留原厂**哈曼卡顿（AK7755EN）DSP 电子分频调音**、顶部触控滑块与音律呼吸氛围灯。
+为**斐讯 R1 智能音箱（Rockchip RK3229 / Android 5.1 / Linux 3.10）**打造的一体化开源固件增强方案：无需拆机换系统，通过极轻量底层 Hook 与内核模块实现 **AirPlay 2 无线无损流媒体**、**蓝牙 A2DP 音箱**、**USB 有线免驱声卡（UAC1，支持电脑端调节硬件音量）** 以及 **内核级 SELinux 穿透（Root 持久化）**，并 100% 保留原厂**哈曼卡顿（AK7755EN）DSP 电子分频调音**、顶部触控滑块与平滑防频闪音律氛围灯。
 
 ---
 
@@ -129,9 +129,11 @@ pipe = {
 };
 ```
 
-### 3. 日常使用
+### 3. 日常使用与无线保活
 - 确保 iPhone / iPad / Mac 与 R1 音箱在同一局域网 Wi-Fi 下。
 - 在苹果设备控制中心或音乐 App 的 AirPlay 列表中选择 **`R1-Music`** 即可无线播放，支持拔掉 USB 线脱机独立运行。
+- **Wi-Fi 防休眠保活**：内置 `wifi_keepalive_thread` 持续维持 Broadcom `bcmdhd` 唤醒状态（关闭 `PM 2` / `SETSUSPENDMODE 1` 组播过滤），并禁用系统休眠优化，避免息屏后 AirPlay 2 断连或搜不到设备。
+- **独立音量**：AirPlay 2 使用独立硬件音量（默认 `180`，可通过顶部触控环或苹果设备滑块调节），不受电脑端 USB 音量调节影响。
 
 ---
 
@@ -141,19 +143,21 @@ pipe = {
 [src/uac1_gadget.c](src/uac1_gadget.c) 实现了针对 Linux 3.10（RK3229）的 **USB Audio Class 1.0 (UAC1) Sink** 驱动，并直接 Hook Android USB Gadget 框架的 `supported_functions[8]`：
 - **复合模式 (`uac1,adb`)**：VID `0x2207`、PID `0x0010`，同时保留 **USB 声卡** 与 **ADB 调试口**。
 - **音频规格**：High-Speed / Full-Speed Isochronous OUT（Adaptive 同步），立体声 **16-bit `S16_LE` / 48000 Hz**。
+- **UAC1 Feature Unit 硬件音量同步**：内置 Master Mute + Volume 控制单元（`-50 dB ~ 0 dB`，`0.5 dB/步` 1:1 对应 AK7755 增益步进），通过 `ioctl 0x5501` 实时同步宿主机音量与静音状态。
 - **无锁环形缓冲**：通过字符设备 `/dev/uac1_audio` 低延迟向用户态输出 PCM 数据。
 
 ### 2. 使用与双模智能切换
-- 使用 **USB A-A 双公头线**连接电脑后，macOS / Windows / Linux 均免驱识别为 **`Phicomm R1 USB Audio Stream`**。
+- 使用 **USB A-A 双公头线**连接电脑后，macOS / Windows / Linux 均免驱识别为 **`Phicomm R1 USB Audio Stream`**，可直接使用电脑系统音量键或音量滑块调节硬件音量与静音。
 - **AirPlay 2 优先抢占**：AirPlay 2 播放时优先占用声卡并持续排空 USB 缓冲；AirPlay 2 停止超过约 2 秒后，若电脑仍在通过 USB 播放，系统自动无缝回切至 USB 有线声卡模式。
 
 ---
 
-## 五、原厂 DSP 调音、物理交互与氛围灯
+## 五、原厂 DSP 调音、蓝牙音箱与氛围灯
 
 1. **原厂哈曼卡顿（AK7755EN）电子分频**：`init_harman_dsp()` 在打开声卡 `mixer_open(2)` 后，自动加载原厂 `data2` 滤波器固件（PRAM / CRAM / OFREG），设置 `DAC MUX` 为 `DSP`，开启高低音双功放 `LineOut Amp1/2`。
-2. **顶部环形触控滑块（`/dev/input/event1`）与中央静音键（`/dev/input/event0`）**：顺时针滑动增大音量、逆时针减小音量（0~207 级），短按中央键全局静音/恢复。
-3. **音律呼吸氛围灯**：独立线程 `ambient_light_thread` 控制 `/sys/class/leds/multi_leds0/led_color` 与 `multi_leds1/led_color`，播放时随音频峰值循环渐变呼吸，静音呈暖琥珀色，待机自动熄灭。
+2. **蓝牙音箱（A2DP Sink）**：自动维持蓝牙 `Scan Mode: 23` 可发现可连接状态（设备名 `Phicomm_R1_XXXX`）；检测到系统蓝牙音频流进入 `RUNNING` 时自动开启 AK7755 功放解静音，并联动呼吸氛围灯。
+3. **顶部环形触控滑块（`/dev/input/event1`）与中央静音键（`/dev/input/event0`）**：顺时针滑动增大音量、逆时针减小音量（0~207 级），短按中央键全局静音/恢复。
+4. **平滑防频闪氛围灯**：独立线程 `ambient_light_thread` 以 `120ms` 稳定节拍配合 RGB 死区过滤驱动 `/sys/class/leds/multi_leds0/led_color` 与 `multi_leds1/led_color`，采用柔和饱和度渐变、低通包络与限幅平滑亮度（彻底消除 I2C 刷新频闪），静音呈暖琥珀色，无有效音频输入超过 `1.5s` 自动平滑渐隐熄灭。
 
 ---
 

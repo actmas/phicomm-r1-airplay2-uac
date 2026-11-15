@@ -87,6 +87,10 @@ typedef _Bool bool;
 
 #define UAC_EP_CS_ATTR_SAMPLE_RATE 0x01
 
+#define UAC_FEATURE_UNIT 0x06
+#define UAC_FU_MUTE      0x01
+#define UAC_FU_VOLUME    0x02
+
 #define USB_ENDPOINT_XFER_ISOC 1
 #define USB_ENDPOINT_SYNC_ADAPTIVE (2 << 2)
 
@@ -250,6 +254,17 @@ struct uac1_output_terminal_descriptor {
     u8 bAssocTerminal;
     u8 bSourceID;
     u8 iTerminal;
+} __attribute__((packed));
+
+struct uac1_feature_unit_descriptor {
+    u8 bLength;
+    u8 bDescriptorType;
+    u8 bDescriptorSubtype;
+    u8 bUnitID;
+    u8 bSourceID;
+    u8 bControlSize;
+    u8 bmaControls[3];
+    u8 iFeature;
 } __attribute__((packed));
 
 struct uac1_as_general_descriptor {
@@ -474,6 +489,10 @@ static volatile u32 ring_head = 0;
 static volatile u32 ring_tail = 0;
 static struct wait_queue_head read_wait;
 static volatile bool streaming_active = false;
+static volatile u8 uac_mute = 0;
+static volatile s16 uac_vol_db = -1669; // ~180/207 of [-12800, 0]
+static volatile u8 uac_vol_0_207 = 180;
+static volatile u16 uac_vol_seq = 0;
 static u32 current_sample_rate = 48000;
 
 /* UAC Context */
@@ -538,7 +557,7 @@ static struct uac1_ac_header_descriptor ac_header_desc = {
     .bDescriptorType = USB_DT_CS_INTERFACE,
     .bDescriptorSubtype = UAC_HEADER,
     .bcdADC = cpu_to_le16(0x0100),
-    .wTotalLength = cpu_to_le16(sizeof(ac_header_desc) + sizeof(struct uac1_input_terminal_descriptor) + sizeof(struct uac1_output_terminal_descriptor)),
+    .wTotalLength = cpu_to_le16(sizeof(ac_header_desc) + sizeof(struct uac1_input_terminal_descriptor) + sizeof(struct uac1_feature_unit_descriptor) + sizeof(struct uac1_output_terminal_descriptor)),
     .bInCollection = 1,
     .baInterfaceNr = { 0 },
 };
@@ -556,6 +575,17 @@ static struct uac1_input_terminal_descriptor it_desc = {
     .iTerminal = 0,
 };
 
+static struct uac1_feature_unit_descriptor fu_desc = {
+    .bLength = sizeof(fu_desc),
+    .bDescriptorType = USB_DT_CS_INTERFACE,
+    .bDescriptorSubtype = UAC_FEATURE_UNIT,
+    .bUnitID = 3,
+    .bSourceID = 1,
+    .bControlSize = 1,
+    .bmaControls = { 0x03, 0x00, 0x00 }, // Master Mute + Volume
+    .iFeature = 0,
+};
+
 static struct uac1_output_terminal_descriptor ot_desc = {
     .bLength = sizeof(ot_desc),
     .bDescriptorType = USB_DT_CS_INTERFACE,
@@ -563,7 +593,7 @@ static struct uac1_output_terminal_descriptor ot_desc = {
     .bTerminalID = 2,
     .wTerminalType = cpu_to_le16(UAC_OUTPUT_TERMINAL_SPEAKER),
     .bAssocTerminal = 0,
-    .bSourceID = 1,
+    .bSourceID = 3,
     .iTerminal = 0,
 };
 
@@ -651,6 +681,7 @@ static struct usb_descriptor_header *fs_audio_desc[] = {
     (struct usb_descriptor_header *)&ac_intf_desc,
     (struct usb_descriptor_header *)&ac_header_desc,
     (struct usb_descriptor_header *)&it_desc,
+    (struct usb_descriptor_header *)&fu_desc,
     (struct usb_descriptor_header *)&ot_desc,
     (struct usb_descriptor_header *)&as_intf_alt0_desc,
     (struct usb_descriptor_header *)&as_intf_alt1_desc,
@@ -666,6 +697,7 @@ static struct usb_descriptor_header *hs_audio_desc[] = {
     (struct usb_descriptor_header *)&ac_intf_desc,
     (struct usb_descriptor_header *)&ac_header_desc,
     (struct usb_descriptor_header *)&it_desc,
+    (struct usb_descriptor_header *)&fu_desc,
     (struct usb_descriptor_header *)&ot_desc,
     (struct usb_descriptor_header *)&as_intf_alt0_desc,
     (struct usb_descriptor_header *)&as_intf_alt1_desc,
@@ -717,6 +749,33 @@ static void uac1_out_complete(void *ep_ptr, struct usb_request *req)
     }
 }
 
+/* EP0 Feature Unit SET_CUR completion */
+static void uac_fu_set_complete(void *ep_ptr, struct usb_request *req)
+{
+    unsigned long cs = (unsigned long)req->context;
+    (void)ep_ptr;
+    req->complete = NULL;
+    if (req->status != 0)
+        return;
+
+    if (cs == UAC_FU_MUTE && req->actual >= 1) {
+        u8 *buf = (u8 *)req->buf;
+        uac_mute = (buf[0] != 0) ? 1 : 0;
+        uac_vol_seq++;
+    } else if (cs == UAC_FU_VOLUME && req->actual >= 2) {
+        u8 *buf = (u8 *)req->buf;
+        s16 db = (s16)((u16)buf[0] | ((u16)buf[1] << 8));
+        if (db < -12800) db = -12800;
+        if (db > 0) db = 0;
+        uac_vol_db = db;
+        int v = (db <= -12672) ? 0 : (207 + (db / 128));
+        if (v < 0) v = 0;
+        if (v > 207) v = 207;
+        uac_vol_0_207 = (u8)v;
+        uac_vol_seq++;
+    }
+}
+
 /* Setup EP0 Class Requests Handler */
 static int uac1_setup(struct usb_function *f, const struct usb_ctrlrequest *ctrl)
 {
@@ -728,7 +787,70 @@ static int uac1_setup(struct usb_function *f, const struct usb_ctrlrequest *ctrl
     u16 w_length = ctrl->wLength;
 
     if ((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS) {
-        if ((ctrl->bRequestType & USB_RECIP_MASK) == USB_RECIP_ENDPOINT) {
+        if ((ctrl->bRequestType & USB_RECIP_MASK) == USB_RECIP_INTERFACE) {
+            u8 unit_id = (u8)((w_index >> 8) & 0xff);
+            u8 intf_id = (u8)(w_index & 0xff);
+            if (unit_id == 3 && intf_id == ac_intf_desc.bInterfaceNumber) {
+                u8 cs = (u8)((w_value >> 8) & 0xff);
+                u8 *buf = (u8 *)req->buf;
+                if (cs == UAC_FU_MUTE) {
+                    switch (ctrl->bRequest) {
+                    case UAC_SET_CUR:
+                        if (w_length == 1) {
+                            req->complete = uac_fu_set_complete;
+                            req->context = (void *)(unsigned long)UAC_FU_MUTE;
+                            value = 1;
+                        }
+                        break;
+                    case UAC_GET_CUR:
+                        if (w_length >= 1) {
+                            buf[0] = uac_mute;
+                            value = 1;
+                        }
+                        break;
+                    }
+                } else if (cs == UAC_FU_VOLUME) {
+                    switch (ctrl->bRequest) {
+                    case UAC_SET_CUR:
+                        if (w_length == 2) {
+                            req->complete = uac_fu_set_complete;
+                            req->context = (void *)(unsigned long)UAC_FU_VOLUME;
+                            value = 2;
+                        }
+                        break;
+                    case UAC_GET_CUR:
+                        if (w_length >= 2) {
+                            s16 db = uac_vol_db;
+                            buf[0] = (u8)(db & 0xff);
+                            buf[1] = (u8)((db >> 8) & 0xff);
+                            value = 2;
+                        }
+                        break;
+                    case UAC_GET_MIN:
+                        if (w_length >= 2) {
+                            buf[0] = 0x00;
+                            buf[1] = 0xce; // -12800 = -50.0 dB
+                            value = 2;
+                        }
+                        break;
+                    case UAC_GET_MAX:
+                        if (w_length >= 2) {
+                            buf[0] = 0x00;
+                            buf[1] = 0x00; // 0.0 dB
+                            value = 2;
+                        }
+                        break;
+                    case UAC_GET_RES:
+                        if (w_length >= 2) {
+                            buf[0] = 0x80;
+                            buf[1] = 0x00; // 128 = 0.5 dB
+                            value = 2;
+                        }
+                        break;
+                    }
+                }
+            }
+        } else if ((ctrl->bRequestType & USB_RECIP_MASK) == USB_RECIP_ENDPOINT) {
             if ((w_index & 0xff) == fs_ep_out_desc.bEndpointAddress) {
                 switch (ctrl->bRequest) {
                 case UAC_SET_CUR:
@@ -765,8 +887,7 @@ static int uac1_setup(struct usb_function *f, const struct usb_ctrlrequest *ctrl
     if (value >= 0) {
         req->length = value;
         req->status = 0;
-        ep0_queue:
-        cdev->gadget->ep0->ops->queue(cdev->gadget->ep0, req, GFP_ATOMIC);
+        return cdev->gadget->ep0->ops->queue(cdev->gadget->ep0, req, GFP_ATOMIC);
     }
     return value;
 }
@@ -981,12 +1102,23 @@ static unsigned int uac1_dev_poll(struct file *file, struct poll_table_struct *p
     return mask;
 }
 
+static long uac1_dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    (void)file;
+    (void)arg;
+    if (cmd == 0x5501) {
+        return (long)(((u32)uac_vol_seq << 16) | ((u32)(uac_mute & 1) << 8) | (u32)(uac_vol_0_207 & 0xff));
+    }
+    return -EOPNOTSUPP;
+}
+
 static const struct file_operations uac1_fops = {
     .owner = NULL,
     .open = uac1_dev_open,
     .release = uac1_dev_release,
     .read = uac1_dev_read,
     .poll = uac1_dev_poll,
+    .unlocked_ioctl = uac1_dev_ioctl,
 };
 
 static struct miscdevice uac1_miscdev = {

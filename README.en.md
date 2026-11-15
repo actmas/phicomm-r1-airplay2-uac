@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-An all-in-one open-source firmware enhancement suite for the **Phicomm R1 Smart Speaker (Rockchip RK3229 / Android 5.1 / Linux 3.10)**. Without replacing the stock OS, it turns the R1 into a standalone **AirPlay 2 lossless wireless speaker** and a **driverless USB Audio Class 1.0 (UAC1) wired DAC**, with **kernel-level SELinux bypass**, while 100% preserving the stock **Harman Kardon (AK7755EN) active crossover DSP**, top capacitive touch ring, and music-reactive ambient LEDs.
+An all-in-one open-source firmware enhancement suite for the **Phicomm R1 Smart Speaker (Rockchip RK3229 / Android 5.1 / Linux 3.10)**. Without replacing the stock OS, it turns the R1 into a standalone **AirPlay 2 lossless wireless speaker**, a **Bluetooth A2DP speaker**, and a **driverless USB Audio Class 1.0 (UAC1) wired DAC (with host volume & mute control)**, with **kernel-level SELinux bypass**, while 100% preserving the stock **Harman Kardon (AK7755EN) active crossover DSP**, top capacitive touch ring, and flicker-free music-reactive ambient LEDs.
 
 ---
 
@@ -104,6 +104,8 @@ The script automatically:
 - **Supervisor Threads**: `r1_init_hook` spawns `nqptp_supervisor_thread` (PTP clock sync on UDP 319/320) and `shairport_supervisor_thread` (AirPlay 2 receiver using built-in `tinysvcmdns`), both protected with `oom_score_adj = -1000`.
 - **Configuration**: Edit [bin/shairport-sync.conf](bin/shairport-sync.conf) to customize the advertised speaker name (default: **`R1-Music`**). Audio is output as `S16` @ `48000 Hz` into `/dev/shm/airplay2_audio` (512KB FIFO).
 - **Usage**: Connect your iPhone / iPad / Mac to the same Wi-Fi network and select **`R1-Music`** in Control Center or any AirPlay-enabled app. Works completely standalone without a PC connected.
+- **Wi-Fi Anti-Sleep Keepalive**: `wifi_keepalive_thread` keeps the Broadcom `bcmdhd` radio awake (preventing `PM 2` / `SETSUSPENDMODE 1` multicast filtering) so AirPlay 2 remains discoverable and stable when idle.
+- **Independent Volume**: AirPlay 2 uses its own hardware volume (`s_vol = 180` by default, adjustable via the top touch ring or AirPlay sender) independent of USB host volume changes.
 
 ---
 
@@ -111,16 +113,18 @@ The script automatically:
 
 - **Kernel Driver**: [src/uac1_gadget.c](src/uac1_gadget.c) implements a USB Audio Class 1.0 Sink for Linux 3.10, hooking `supported_functions[8]` to expose composite mode **`uac1,adb`** (VID `0x2207`, PID `0x0010`), keeping ADB functional alongside USB audio.
 - **Audio Format**: High-Speed / Full-Speed Isochronous OUT (Adaptive), Stereo **16-bit `S16_LE` / 48000 Hz**, streamed via lockless ring buffer `/dev/uac1_audio`.
+- **UAC1 Feature Unit (Host Volume & Mute)**: Exposes Master Mute + Volume (`-50 dB` to `0 dB`, `0.5 dB/step` matched 1:1 to AK7755 hardware steps) synced via `ioctl 0x5501`, so macOS / Windows / Linux volume keys and sliders control the speaker directly.
 - **Plug & Play**: Connect via a USB A-A data cable to macOS, Windows, or Linux — recognized automatically as **`Phicomm R1 USB Audio Stream`**.
 - **Smart Dual-Mode Switching**: AirPlay 2 preempts USB audio immediately when active (while draining `/dev/uac1_audio` to prevent stalls) and automatically falls back to USB DAC ~2 seconds after AirPlay 2 stops.
 
 ---
 
-## 5. Stock Harman DSP, Touch Controls & Ambient LEDs
+## 5. Stock Harman DSP, Bluetooth Speaker & Ambient LEDs
 
 1. **Harman Kardon AK7755EN Active Crossover**: `init_harman_dsp()` configures `DRAM Size`, `DLRAM Mode`, loads stock `data2` PRAM/CRAM/OFREG firmware, routes `DAC MUX` to `DSP`, and enables `LineOut Amp1/2`.
-2. **Capacitive Touch Ring & Center Key**: `/dev/input/event1` adjusts hardware `DAC Digital Volume L/R` (`0–207`); `/dev/input/event0` toggles global mute.
-3. **Music-Reactive Ambient LEDs**: `ambient_light_thread` drives `/sys/class/leds/multi_leds0/led_color` and `multi_leds1/led_color` with HSV color cycling and peak-reactive brightness during playback, warm amber on mute, and smooth fade-out on idle.
+2. **Bluetooth Speaker (A2DP Sink)**: Keeps Bluetooth discoverable/connectable (`Scan Mode: 23`, `Phicomm_R1_XXXX`), automatically unmutes the AK7755 amps when Android `card 2` enters `RUNNING`, and drives breathing ambient LEDs during playback.
+3. **Capacitive Touch Ring & Center Key**: `/dev/input/event1` adjusts hardware `DAC Digital Volume L/R` (`0–207`); `/dev/input/event0` toggles global mute.
+4. **Flicker-Free Ambient LEDs**: `ambient_light_thread` drives `/sys/class/leds/multi_leds0/led_color` and `multi_leds1/led_color` at a `120ms` cadence with RGB deadband filtering, soft-saturated HSV color drift, low-pass envelope slew limiting, warm amber on mute, and smooth fade-out to off after `1.5s` of silence.
 
 ---
 

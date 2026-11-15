@@ -70,6 +70,8 @@ int execl(const char *, const char *, ...);
 int flock(int, int);
 #define F_SETPIPE_SZ 1031
 int fcntl(int, int, ...);
+void *mmap(void *, size_t, int, int, int, long);
+int munmap(void *, size_t);
 
 /* Socket API */
 #define AF_UNIX 1
@@ -194,7 +196,32 @@ static struct pcm *s_pcm = NULL;
 static struct mixer *s_mixer = NULL;
 static int s_active_rate = 0;
 static int s_usb_playing = 0;
+static int s_usb_vol = 180;
+static int s_usb_muted = 0;
 static int s_airplay_active = 0;
+static int s_bt_playing = 0;
+
+static int buf_has_running_state(const char *buf, int len) {
+    const char pat[] = "RUNNING";
+    for (int i = 0; i <= len - 7; i++) {
+        int match = 1;
+        for (int j = 0; j < 7; j++) {
+            if (buf[i + j] != pat[j]) { match = 0; break; }
+        }
+        if (match) return 1;
+    }
+    return 0;
+}
+
+static int is_card2_externally_active(void) {
+    int fd = open("/proc/asound/card2/pcm0p/sub0/status", O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[64];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    return buf_has_running_state(buf, (int)n);
+}
 static int s_vol = 180;       // Default ~85% volume
 static int s_is_muted = 0;
 static int s_last_touch_pos = -1;
@@ -320,6 +347,13 @@ static void apply_volume(struct mixer *m, int vol) {
 
 /* Music Rhythm-Reactive Ambient Light */
 static volatile int s_audio_energy = 0;
+static volatile unsigned long s_last_nonzero_audio_ms = 0;
+
+static unsigned long get_monotonic_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (unsigned long)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+}
 
 static void feed_audio_samples(const void *buf, size_t bytes) {
     const int16_t *s = (const int16_t *)buf;
@@ -330,15 +364,12 @@ static void feed_audio_samples(const void *buf, size_t bytes) {
         if (v < 0) v = -v;
         if (v > peak) peak = v;
     }
+    if (peak > 24) {
+        s_last_nonzero_audio_ms = get_monotonic_ms();
+    }
     if (peak > s_audio_energy) {
         s_audio_energy = peak;
     }
-}
-
-static unsigned long get_monotonic_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (unsigned long)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
 }
 
 static void hsv_to_rgb(int h, int v, int *r, int *g, int *b) {
@@ -347,9 +378,11 @@ static void hsv_to_rgb(int h, int v, int *r, int *g, int *b) {
     if (h < 0) h += 360;
     int region = h / 60;
     int remainder = (h - (region * 60)) * 255 / 60;
-    int p = 0;
-    int q = (v * (255 - remainder)) / 255;
-    int t = (v * remainder) / 255;
+    /* Soft saturation (~65% saturation) so transitions blend organically without harsh neon jumps */
+    int p = (v * 35) / 100;
+    int span = v - p;
+    int q = p + (span * (255 - remainder)) / 255;
+    int t = p + (span * remainder) / 255;
     switch (region) {
         case 0:  *r = v; *g = t; *b = p; break;
         case 1:  *r = q; *g = v; *b = p; break;
@@ -362,8 +395,13 @@ static void hsv_to_rgb(int h, int v, int *r, int *g, int *b) {
 
 static void write_led_color(int r, int g, int b) {
     static int last_r = -1, last_g = -1, last_b = -1;
-    if ((r || g || b) && r == last_r && g == last_g && b == last_b) {
-        return;
+    if (r == 0 && g == 0 && b == 0) {
+        if (last_r == 0 && last_g == 0 && last_b == 0) return;
+    } else if (last_r >= 0) {
+        int dr = r - last_r; if (dr < 0) dr = -dr;
+        int dg = g - last_g; if (dg < 0) dg = -dg;
+        int db = b - last_b; if (db < 0) db = -db;
+        if (dr < 2 && dg < 2 && db < 2) return;
     }
     last_r = r; last_g = g; last_b = b;
 
@@ -384,70 +422,91 @@ static void write_led_color(int r, int g, int b) {
     }
 }
 
-static void update_playback_light(int is_playing) {
-    static int s_hue = 200; // Deep elegant blue/cyan start
+static int update_playback_light(int is_playing) {
+    static int s_hue_x10 = 2000; /* 200.0 deg deep blue/cyan start */
     static int s_envelope = 0;
-    static int s_was_playing = 0;
+    static int s_smooth_bri = 0;
 
     if (!is_playing) {
-        if (s_was_playing) {
-            // Smooth musical fade out
-            if (s_envelope > 500) {
-                s_envelope = (s_envelope * 7) / 10;
-                int brightness = 20 + (s_envelope * 60) / 10000;
-                if (brightness > 255) brightness = 255;
-                int r, g, b;
-                hsv_to_rgb(s_hue, brightness, &r, &g, &b);
-                write_led_color(r, g, b);
-                return;
-            }
-            s_envelope = 0;
-            s_was_playing = 0;
+        s_envelope = 0;
+        if (s_smooth_bri > 0) {
+            s_smooth_bri -= 16;
+            if (s_smooth_bri < 0) s_smooth_bri = 0;
+        }
+        if (s_smooth_bri > 0) {
+            int v_out = (s_smooth_bri * s_smooth_bri) / 255;
+            if (v_out < 8) v_out = 8;
+            int r, g, b;
+            hsv_to_rgb(s_hue_x10 / 10, v_out, &r, &g, &b);
+            write_led_color(r, g, b);
+            return 1;
         }
         write_led_color(0, 0, 0);
-        return;
+        return 0;
     }
 
     if (s_is_muted) {
-        write_led_color(255, 40, 0); // Warm amber when muted
-        s_was_playing = 1;
-        return;
+        write_led_color(255, 40, 0); /* Warm amber when muted */
+        return 1;
     }
 
-    s_was_playing = 1;
-
-    // Read current audio peak and clear atomically
+    /* Read current audio peak and clear atomically */
     int current_energy = s_audio_energy;
     s_audio_energy = 0;
 
-    // Fast attack on beats, smooth musical decay
+    /* Heavy low-pass envelope at 120ms cadence: 15% attack, 90% decay */
     if (current_energy > s_envelope) {
-        s_envelope = (s_envelope * 3 + current_energy * 7) / 10;
+        s_envelope = (s_envelope * 85 + current_energy * 15) / 100;
     } else {
-        s_envelope = (s_envelope * 88) / 100;
+        s_envelope = (s_envelope * 90) / 100;
     }
 
-    // Map audio peak (0-32767) to brightness (45-255)
-    // 45 base brightness ensures a visible, elegant ambient glow at all times during playback!
-    int brightness = 45 + (s_envelope * 210) / 14000;
-    if (brightness > 255) brightness = 255;
+    int target_bri;
+    if (s_bt_playing && !s_airplay_active && !s_usb_playing) {
+        /* Gentle breathing glow during Bluetooth/Android playback */
+        static int bt_phase = 0;
+        bt_phase = (bt_phase + 1) % 40;
+        int tri = (bt_phase < 20) ? bt_phase : (40 - bt_phase); /* 0..20 */
+        target_bri = 100 + (tri * 90) / 20; /* 100..190 */
+    } else {
+        target_bri = 90 + (s_envelope * 145) / 16000;
+        if (target_bri > 235) target_bri = 235;
+    }
 
-    // Slowly cycle hue for living color ambiance
-    s_hue = (s_hue + 1) % 360;
+    /* Slew-rate limit brightness changes (<= 4 per 120ms frame) to prevent visible flicker */
+    int diff = target_bri - s_smooth_bri;
+    if (diff > 4) diff = 4;
+    else if (diff < -4) diff = -4;
+    s_smooth_bri += diff;
+
+    /* Perceptual gamma curve (v^2 / 255), floor at 24 to avoid low-bit PWM stepping */
+    int v_out = (s_smooth_bri * s_smooth_bri) / 255;
+    if (v_out < 24 && s_smooth_bri > 0) v_out = 24;
+
+    /* Slow, organic hue drift: +0.5 deg per 120ms frame (~86s per full cycle) */
+    s_hue_x10 = (s_hue_x10 + 5) % 3600;
 
     int r, g, b;
-    hsv_to_rgb(s_hue, brightness, &r, &g, &b);
+    hsv_to_rgb(s_hue_x10 / 10, v_out, &r, &g, &b);
 
     write_led_color(r, g, b);
+    return 1;
 }
 
 /* Dedicated ambient light worker thread (completely isolated from ALSA playback) */
 static void *ambient_light_thread(void *arg) {
     (void)arg;
     while (1) {
-        int is_playing = (s_airplay_active || s_usb_playing);
-        update_playback_light(is_playing);
-        usleep(is_playing ? 60000 : 1000000);
+        int has_pcm_audio = 0;
+        if (s_airplay_active || s_usb_playing) {
+            unsigned long now = get_monotonic_ms();
+            if (s_last_nonzero_audio_ms != 0 && (now - s_last_nonzero_audio_ms) <= 1500) {
+                has_pcm_audio = 1;
+            }
+        }
+        int is_playing = (has_pcm_audio || s_bt_playing);
+        int active_or_fading = update_playback_light(is_playing);
+        usleep(active_or_fading ? 120000 : 250000);
     }
     return NULL;
 }
@@ -513,6 +572,311 @@ static void handle_key_event(struct mixer *m, int key_fd) {
 }
 
 /* --- Supervisor Threads for AirPlay 2 Daemons --- */
+
+#define WIFI_IFNAMSIZ 16
+#define WIFI_SIOCDEVPRIVATE 0x89F0
+
+struct wifi_ifreq {
+    char ifr_name[WIFI_IFNAMSIZ];
+    union {
+        char pad[16];
+        void *ifr_data;
+    };
+};
+
+struct android_wifi_priv_cmd {
+    char *buf;
+    int used_len;
+    int total_len;
+};
+
+static int wlan0_priv_cmd(int sock, const char *cmd_str) {
+    struct wifi_ifreq ifr;
+    struct android_wifi_priv_cmd priv_cmd;
+    char buf[128];
+
+    memset(&ifr, 0, sizeof(ifr));
+    memset(&priv_cmd, 0, sizeof(priv_cmd));
+    memset(buf, 0, sizeof(buf));
+    strncpy(ifr.ifr_name, "wlan0", WIFI_IFNAMSIZ - 1);
+    strncpy(buf, cmd_str, sizeof(buf) - 1);
+    priv_cmd.buf = buf;
+    priv_cmd.used_len = (int)strlen(buf) + 1;
+    priv_cmd.total_len = sizeof(buf);
+    ifr.ifr_data = &priv_cmd;
+    return ioctl(sock, WIFI_SIOCDEVPRIVATE + 1, &ifr);
+}
+
+/* --- Bluetooth Discoverable Keepalive (Android Binder) --- */
+
+#define BINDER_PROT_READ       1
+#define BINDER_MAP_PRIVATE     2
+#define BINDER_MAP_FAILED      ((void *)-1)
+#define BINDER_WRITE_READ      0xc0186201UL
+#define BINDER_SET_MAX_THREADS 0x40046205UL
+#define BINDER_TYPE_BINDER     0x73622a85U
+#define BC_TRANSACTION         0x40286300U
+#define BC_FREE_BUFFER         0x40046303U
+#define BC_ACQUIRE             0x40046305U
+#define BC_ENTER_LOOPER        0x0000630cU
+#define BR_NOOP                0x0000720cU
+#define BR_TRANSACTION_COMPLETE 0x00007206U
+#define BR_REPLY               0x80287203U
+#define BR_FAILED_REPLY        0x00007211U
+#define BR_DEAD_REPLY          0x00007205U
+
+struct r1_binder_write_read {
+    size_t write_size;
+    size_t write_consumed;
+    unsigned long write_buffer;
+    size_t read_size;
+    size_t read_consumed;
+    unsigned long read_buffer;
+};
+
+struct r1_binder_txn_data {
+    union { uint32_t handle; void *ptr; } target;
+    void *cookie;
+    uint32_t code;
+    uint32_t flags;
+    int32_t sender_pid;
+    uint32_t sender_euid;
+    size_t data_size;
+    size_t offsets_size;
+    union {
+        struct { const void *buffer; const void *offsets; } ptr;
+        uint8_t buf[8];
+    } data;
+};
+
+struct r1_flat_binder_obj {
+    uint32_t type;
+    uint32_t flags;
+    union { void *binder; uint32_t handle; };
+    void *cookie;
+};
+
+struct r1_parcel {
+    uint8_t data[512];
+    size_t pos;
+    size_t offsets[8];
+    size_t num_offsets;
+};
+
+static void r1_parcel_init(struct r1_parcel *p) {
+    memset(p, 0, sizeof(*p));
+}
+
+static void r1_parcel_i32(struct r1_parcel *p, int32_t v) {
+    memcpy(p->data + p->pos, &v, 4);
+    p->pos += 4;
+}
+
+static void r1_parcel_str16(struct r1_parcel *p, const char *s) {
+    size_t len = strlen(s);
+    r1_parcel_i32(p, (int32_t)len);
+    for (size_t i = 0; i < len; i++) {
+        uint16_t ch = (uint8_t)s[i];
+        memcpy(p->data + p->pos, &ch, 2);
+        p->pos += 2;
+    }
+    uint16_t nul = 0;
+    memcpy(p->data + p->pos, &nul, 2);
+    p->pos += 2;
+    while (p->pos & 3) p->data[p->pos++] = 0;
+}
+
+static void r1_parcel_iface(struct r1_parcel *p, const char *iface) {
+    r1_parcel_i32(p, 0);
+    r1_parcel_str16(p, iface);
+}
+
+static void r1_parcel_local_binder(struct r1_parcel *p, void *ptr) {
+    struct r1_flat_binder_obj obj;
+    memset(&obj, 0, sizeof(obj));
+    obj.type = BINDER_TYPE_BINDER;
+    obj.flags = 0x7f;
+    obj.binder = ptr;
+    obj.cookie = ptr;
+    p->offsets[p->num_offsets++] = p->pos;
+    memcpy(p->data + p->pos, &obj, sizeof(obj));
+    p->pos += sizeof(obj);
+}
+
+static int r1_binder_transact(int fd, uint32_t handle, uint32_t code, struct r1_parcel *in,
+                              uint8_t *reply_out, size_t *reply_len, uint32_t *reply_handle) {
+    struct {
+        uint32_t cmd;
+        struct r1_binder_txn_data txn;
+    } __attribute__((packed)) wbuf;
+    memset(&wbuf, 0, sizeof(wbuf));
+    wbuf.cmd = BC_TRANSACTION;
+    wbuf.txn.target.handle = handle;
+    wbuf.txn.code = code;
+    wbuf.txn.flags = 0x10;
+    wbuf.txn.data_size = in->pos;
+    wbuf.txn.offsets_size = in->num_offsets * sizeof(size_t);
+    wbuf.txn.data.ptr.buffer = in->data;
+    wbuf.txn.data.ptr.offsets = in->num_offsets ? in->offsets : NULL;
+
+    uint8_t rbuf[512];
+    struct r1_binder_write_read bwr;
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(wbuf);
+    bwr.write_buffer = (unsigned long)&wbuf;
+    bwr.read_size = sizeof(rbuf);
+    bwr.read_buffer = (unsigned long)rbuf;
+
+    while (1) {
+        if (ioctl(fd, BINDER_WRITE_READ, &bwr) < 0) return -1;
+        size_t off = 0;
+        while (off + 4 <= bwr.read_consumed) {
+            uint32_t cmd;
+            memcpy(&cmd, rbuf + off, 4);
+            off += 4;
+            if (cmd == BR_NOOP || cmd == BR_TRANSACTION_COMPLETE) continue;
+            if (cmd == BR_FAILED_REPLY || cmd == BR_DEAD_REPLY) return -1;
+            if (cmd == BR_REPLY) {
+                struct r1_binder_txn_data tr;
+                memcpy(&tr, rbuf + off, sizeof(tr));
+                off += sizeof(tr);
+                if (reply_out && reply_len) {
+                    size_t n = tr.data_size < *reply_len ? tr.data_size : *reply_len;
+                    memcpy(reply_out, tr.data.ptr.buffer, n);
+                    *reply_len = n;
+                }
+                if (reply_handle && tr.offsets_size >= sizeof(size_t)) {
+                    size_t obj_off = 0;
+                    memcpy(&obj_off, tr.data.ptr.offsets, sizeof(size_t));
+                    struct r1_flat_binder_obj obj;
+                    memcpy(&obj, (const uint8_t *)tr.data.ptr.buffer + obj_off, sizeof(obj));
+                    *reply_handle = obj.handle;
+                    struct { uint32_t cmd; uint32_t handle; } __attribute__((packed)) abuf = { BC_ACQUIRE, obj.handle };
+                    struct r1_binder_write_read abwr;
+                    memset(&abwr, 0, sizeof(abwr));
+                    abwr.write_size = sizeof(abuf);
+                    abwr.write_buffer = (unsigned long)&abuf;
+                    ioctl(fd, BINDER_WRITE_READ, &abwr);
+                }
+                struct { uint32_t cmd; const void *ptr; } __attribute__((packed)) fbuf = { BC_FREE_BUFFER, tr.data.ptr.buffer };
+                struct r1_binder_write_read fbwr;
+                memset(&fbwr, 0, sizeof(fbwr));
+                fbwr.write_size = sizeof(fbuf);
+                fbwr.write_buffer = (unsigned long)&fbuf;
+                ioctl(fd, BINDER_WRITE_READ, &fbwr);
+                return 0;
+            }
+        }
+        bwr.write_size = 0;
+        bwr.write_consumed = 0;
+        bwr.read_consumed = 0;
+    }
+}
+
+static void ensure_bt_discoverable(void) {
+    static int bt_fd = -1;
+    static void *bt_map = BINDER_MAP_FAILED;
+    static uint32_t ibt_handle = 0;
+    static int dummy_cb = 1;
+
+    if (bt_fd < 0) {
+        bt_fd = open("/dev/binder", O_RDWR);
+        if (bt_fd < 0) return;
+        bt_map = mmap(NULL, 128 * 1024, BINDER_PROT_READ, BINDER_MAP_PRIVATE, bt_fd, 0);
+        if (bt_map == BINDER_MAP_FAILED) {
+            close(bt_fd);
+            bt_fd = -1;
+            return;
+        }
+        uint32_t max_t = 0;
+        ioctl(bt_fd, BINDER_SET_MAX_THREADS, &max_t);
+        uint32_t enter = BC_ENTER_LOOPER;
+        struct r1_binder_write_read ebwr;
+        memset(&ebwr, 0, sizeof(ebwr));
+        ebwr.write_size = sizeof(enter);
+        ebwr.write_buffer = (unsigned long)&enter;
+        ioctl(bt_fd, BINDER_WRITE_READ, &ebwr);
+        ibt_handle = 0;
+    }
+
+    struct r1_parcel p;
+    uint8_t reply[128];
+    size_t rlen;
+
+    if (ibt_handle == 0) {
+        uint32_t mgr_handle = 0;
+        rlen = sizeof(reply);
+        r1_parcel_init(&p);
+        r1_parcel_iface(&p, "android.os.IServiceManager");
+        r1_parcel_str16(&p, "bluetooth_manager");
+        if (r1_binder_transact(bt_fd, 0, 1, &p, reply, &rlen, &mgr_handle) < 0 || mgr_handle == 0) {
+            goto reset_binder;
+        }
+        rlen = sizeof(reply);
+        r1_parcel_init(&p);
+        r1_parcel_iface(&p, "android.bluetooth.IBluetoothManager");
+        r1_parcel_local_binder(&p, &dummy_cb);
+        if (r1_binder_transact(bt_fd, mgr_handle, 1, &p, reply, &rlen, &ibt_handle) < 0 || ibt_handle == 0) {
+            goto reset_binder;
+        }
+    }
+
+    rlen = sizeof(reply);
+    r1_parcel_init(&p);
+    r1_parcel_iface(&p, "android.bluetooth.IBluetooth");
+    if (r1_binder_transact(bt_fd, ibt_handle, 10, &p, reply, &rlen, NULL) < 0 || rlen < 8) {
+        goto reset_binder;
+    }
+    int32_t exc = 0, mode = 0;
+    memcpy(&exc, reply, 4);
+    memcpy(&mode, reply + 4, 4);
+    if (exc == 0 && mode != 23) {
+        rlen = sizeof(reply);
+        r1_parcel_init(&p);
+        r1_parcel_iface(&p, "android.bluetooth.IBluetooth");
+        r1_parcel_i32(&p, 23); // SCAN_MODE_CONNECTABLE_DISCOVERABLE
+        r1_parcel_i32(&p, 0);  // infinite duration
+        if (r1_binder_transact(bt_fd, ibt_handle, 11, &p, reply, &rlen, NULL) == 0) {
+            klog("<4>[r1_uac] Bluetooth scan mode %d -> 23 (discoverable)\n", mode);
+        }
+    }
+    return;
+
+reset_binder:
+    if (bt_map != BINDER_MAP_FAILED) munmap(bt_map, 128 * 1024);
+    bt_map = BINDER_MAP_FAILED;
+    if (bt_fd >= 0) close(bt_fd);
+    bt_fd = -1;
+    ibt_handle = 0;
+}
+
+static void *wifi_keepalive_thread(void *arg) {
+    (void)arg;
+    // Acquire partial wake lock so the kernel does not suspend networking
+    write_sys("/sys/power/wake_lock", "r1_airplay_keepalive");
+
+    // Wait for wlan0 and Bluetooth service to initialize after boot
+    sleep(5);
+
+    unsigned int tick = 0;
+    while (1) {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            if (tick % 10 == 0) {
+                wlan0_priv_cmd(sock, "SETSUSPENDMODE 0");
+            }
+            wlan0_priv_cmd(sock, "RXFILTER-STOP");
+            wlan0_priv_cmd(sock, "PM 0");
+            close(sock);
+        }
+        if (tick >= 1) {
+            ensure_bt_discoverable();
+        }
+        tick++;
+        sleep(30);
+    }
+    return NULL;
+}
 
 static void *nqptp_supervisor_thread(void *arg) {
     (void)arg;
@@ -618,12 +982,29 @@ static void run_uac1_bridge(void) {
     char audio_buf[4096];
     struct pollfd pfds[4];
     time_t last_airplay_activity = 0;
+    int last_uac_vol_seq = -1;
 
     while (1) {
         if (uac_fd < 0) {
             uac_fd = open("/dev/uac1_audio", O_RDONLY);
             if (uac_fd >= 0) {
                 klog("<4>[r1_uac] bridge: /dev/uac1_audio opened (fd=%d)\n", uac_fd);
+            }
+        }
+        if (uac_fd >= 0) {
+            int vinfo = ioctl(uac_fd, 0x5501, 0UL);
+            if (vinfo >= 0) {
+                int seq = (vinfo >> 16) & 0x7fff;
+                if (last_uac_vol_seq < 0) {
+                    last_uac_vol_seq = seq;
+                } else if (seq != last_uac_vol_seq) {
+                    last_uac_vol_seq = seq;
+                    s_usb_vol = vinfo & 0xff;
+                    s_usb_muted = (vinfo >> 8) & 1;
+                    if (s_mixer && !s_airplay_active && !s_bt_playing) {
+                        apply_volume(s_mixer, s_usb_muted ? 0 : s_usb_vol);
+                    }
+                }
             }
         }
         pfds[0].fd = uac_fd;
@@ -692,6 +1073,7 @@ static void run_uac1_bridge(void) {
                             if (s_pcm && pcm_is_ready(s_pcm)) {
                                 s_active_rate = 48000;
                                 s_airplay_active = 1;
+                                s_bt_playing = 0;
                                 klog("<4>[r1_uac] AirPlay 2 ACTIVE @ 48000Hz (vol=%d)\n", s_vol);
                             } else {
                                 klog("<3>[r1_uac] AirPlay 2 pcm_open failed\n");
@@ -762,20 +1144,21 @@ static void run_uac1_bridge(void) {
                         if (!s_mixer) s_mixer = mixer_open(2);
                         if (s_mixer && !s_dsp_initialized) init_harman_dsp(s_mixer);
                         set_amp_state(s_mixer, 1);
-                        apply_volume(s_mixer, s_vol);
+                        apply_volume(s_mixer, s_usb_muted ? 0 : s_usb_vol);
 
                         s_pcm = pcm_open(2, 0, PCM_OUT, &s_config_48k);
                         if (s_pcm && pcm_is_ready(s_pcm)) {
                             s_active_rate = 48000;
                             s_usb_playing = 1;
-                            klog("<4>[r1_uac] USB playback ACTIVE @ 48000Hz (vol=%d)\n", s_vol);
+                            s_bt_playing = 0;
+                            klog("<4>[r1_uac] USB playback ACTIVE @ 48000Hz (usb_vol=%d)\n", s_usb_vol);
                         } else {
                             klog("<3>[r1_uac] USB pcm_open failed\n");
                             if (s_pcm) { pcm_close(s_pcm); s_pcm = NULL; }
                             set_amp_state(s_mixer, 0);
                         }
                     }
-                    if (s_pcm && s_active_rate == 48000 && !s_is_muted) {
+                    if (s_pcm && s_active_rate == 48000 && !s_usb_muted) {
                         pcm_write(s_pcm, audio_buf, (unsigned int)n);
                     }
                 }
@@ -797,6 +1180,31 @@ static void run_uac1_bridge(void) {
                 klog("<4>[r1_uac] USB playback IDLE (Amps OFF)\n");
             }
             pthread_mutex_unlock(&s_audio_lock);
+        }
+
+        // Unmute AK7755 DAC when Android mediaserver (e.g., Bluetooth A2DP Sink) opens card 2 while AirPlay/USB are idle
+        if (!s_airplay_active && !s_usb_playing) {
+            int ext_active = is_card2_externally_active();
+            if (ext_active && !s_bt_playing) {
+                pthread_mutex_lock(&s_audio_lock);
+                if (!s_airplay_active && !s_usb_playing && !s_pcm) {
+                    if (!s_mixer) s_mixer = mixer_open(2);
+                    if (s_mixer && !s_dsp_initialized) init_harman_dsp(s_mixer);
+                    set_amp_state(s_mixer, 1);
+                    apply_volume(s_mixer, s_vol);
+                    s_bt_playing = 1;
+                    klog("<4>[r1_uac] Bluetooth/Android audio ACTIVE (Amps ON, vol=%d)\n", s_vol);
+                }
+                pthread_mutex_unlock(&s_audio_lock);
+            } else if (!ext_active && s_bt_playing) {
+                pthread_mutex_lock(&s_audio_lock);
+                if (!s_airplay_active && !s_usb_playing && s_bt_playing) {
+                    if (s_mixer) set_amp_state(s_mixer, 0);
+                    s_bt_playing = 0;
+                    klog("<4>[r1_uac] Bluetooth/Android audio IDLE (Amps OFF)\n");
+                }
+                pthread_mutex_unlock(&s_audio_lock);
+            }
         }
     }
 }
@@ -879,6 +1287,10 @@ int main(int argc, char **argv) {
             write(fd, "-1000", 5);
             close(fd);
         }
+
+        // Start Wi-Fi keepalive thread (disables bcmdhd power-save & RX filter so AirPlay stays reachable)
+        pthread_t wifi_tid;
+        pthread_create(&wifi_tid, NULL, wifi_keepalive_thread, NULL);
 
         // Start NQPTP PTP clock sync supervisor thread
         pthread_t ptpid;

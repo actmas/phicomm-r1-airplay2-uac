@@ -143,9 +143,11 @@ ADB=$(get_adb_cmd) || {
 $ADB wait-for-device 2>/dev/null || true
 sleep 3
 
-echo "[*] 禁用斐讯 AI 语音与内置旧版播放器 (com.phicomm.speaker.device / player)..."
+echo "[*] 禁用斐讯 AI 语音、旧版播放器与蓝牙隐藏监控 (com.phicomm.speaker.device / player / systemtool)..."
 $ADB shell "su -c 'CLASSPATH=/system/framework/pm.jar app_process /system/bin com.android.commands.pm.Pm disable com.phicomm.speaker.device'" || true
 $ADB shell "su -c 'CLASSPATH=/system/framework/pm.jar app_process /system/bin com.android.commands.pm.Pm disable com.phicomm.speaker.player'" || true
+$ADB shell "su -c 'CLASSPATH=/system/framework/pm.jar app_process /system/bin com.android.commands.pm.Pm disable com.phicomm.speaker.systemtool'" || true
+$ADB shell "su -c 'settings put global wifi_suspend_optimizations_enabled 0'" || true
 
 echo "[*] 部署 AirPlay 2 守护进程与配置至 /data/local/airplay2/..."
 $ADB shell "su -c 'mkdir -p /data/local/airplay2 && chmod 755 /data/local/airplay2'" >/dev/null 2>&1 || true
