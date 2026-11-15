@@ -60,12 +60,28 @@ flowchart TD
 - On startup, `r1_init_hook` calls `syscall(__NR_init_module, ...)` to load the embedded `uac1_gadget.ko`, which locates `selinux_enforcing` via `kallsyms_lookup_name` and sets it to `0` (Permissive) at Ring 0.
 
 ### 2.3 One-Click Flash & Deploy
+
+#### macOS / Linux
 Run from the project root:
 ```bash
 chmod +x flash_r1_uac.sh
 ./flash_r1_uac.sh
 ```
 > If multiple Android devices are connected, specify the target serial via `ADB_SERIAL=<serial> ./flash_r1_uac.sh` or `./flash_r1_uac.sh -s <serial>`.
+
+#### Windows
+1. **Driver Prerequisites (for flashing only)**:
+   - Install Rockchip **DriverAssitant** (for Loader / Maskrom mode) and Android `platform-tools` (`adb.exe`).
+   - Place `rkdeveloptool.exe` in the project root (or in your `PATH`).
+2. **Option A: One-Click Script (Recommended)**:
+   - Double-click [flash_r1_uac.bat](flash_r1_uac.bat) or run in PowerShell:
+     ```powershell
+     .\flash_r1_uac.ps1
+     # With multiple devices: .\flash_r1_uac.ps1 -Serial <serial>
+     ```
+3. **Option B: Rockchip GUI Tool (`RKDevTool.exe`)**:
+   - Reboot the R1 into Loader mode, open `RKDevTool.exe`, and write `r1_uac_firmware_hook.bin` to LBA address **`0x2b16e8`**.
+   - For daily USB audio playback on Windows 10/11, the built-in `usbaudio.sys` driver works **plug-and-play without extra audio drivers**.
 
 The script automatically:
 1. Reboots the R1 into Rockchip Loader mode via `reboot_loader` (supports `rkdeveloptool-mac` on macOS and `rkdeveloptool` on Linux).

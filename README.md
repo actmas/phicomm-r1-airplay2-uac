@@ -61,12 +61,28 @@ flowchart TD
 - 在 `r1_init_hook` 启动后，通过 `syscall(__NR_init_module, ...)` 从内存加载内置的 `uac1_gadget.ko` 内核模块。该模块在内核态通过 `kallsyms_lookup_name("selinux_enforcing")` 将 `selinux_enforcing` 置为 `0`（Permissive 模式），彻底解除权限封锁。
 
 ### 3. 一键刷入与部署
+
+#### macOS / Linux
 在项目根目录执行：
 ```bash
 chmod +x flash_r1_uac.sh
 ./flash_r1_uac.sh
 ```
 > 若电脑同时连接了多台 Android 设备，可通过环境变量或参数指定目标 R1 序列号：`ADB_SERIAL=<你的设备序列号> ./flash_r1_uac.sh` 或 `./flash_r1_uac.sh -s <你的设备序列号>`。
+
+#### Windows
+1. **驱动准备（仅刷机时需要）**：
+   - 安装 Rockchip 官方 USB 驱动 **DriverAssitant**（用于识别 Loader / Maskrom 烧录模式）与 Android `platform-tools`（提供 `adb.exe`）。
+   - 将 `rkdeveloptool.exe` 放入项目根目录（或加入系统 `PATH`）。
+2. **方式 A：一键脚本（推荐）**：
+   - 双击运行 [flash_r1_uac.bat](flash_r1_uac.bat)，或在 PowerShell 中执行：
+     ```powershell
+     .\flash_r1_uac.ps1
+     # 多设备时可指定序列号：.\flash_r1_uac.ps1 -Serial <你的设备序列号>
+     ```
+3. **方式 B：Rockchip 图形化工具（RKDevTool / AndroidTool）**：
+   - 若不想使用命令行，可使用 `adb shell su -c '/data/local/tmp/reboot_loader'` 让音箱进入 Loader 模式后，打开 `RKDevTool.exe`，在「下载镜像 / 高级功能」中将 `r1_uac_firmware_hook.bin` 写入偏移地址 **`0x2b16e8`**。
+   - 刷入后使用 Windows 10/11 连接 USB 声卡时，系统自带 `usbaudio.sys` **免驱即插即用**，无需安装任何声卡驱动。
 
 脚本会自动完成以下全套工序：
 1. **进入 Rockchip Loader 烧录模式**：自动检测设备状态，若未处于烧录模式则通过 ADB 推送 `reboot_loader` 并软重启进入 Loader（支持 macOS `rkdeveloptool-mac` 与 Linux `rkdeveloptool`）。
