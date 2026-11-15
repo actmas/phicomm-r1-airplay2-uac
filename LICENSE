@@ -19,3 +19,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+Third-Party Notices:
+- Prebuilt binaries and patches for `shairport-sync` and `nqptp` are based on
+  Mike Brady's upstream projects (https://github.com/mikebrady/shairport-sync
+  and https://github.com/mikebrady/nqptp), subject to their respective licenses.
+- `uac1_gadget.c` targets Linux 3.10 kernel interfaces (GPL-2.0 compatible).
