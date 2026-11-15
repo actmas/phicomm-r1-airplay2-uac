@@ -1,0 +1,15 @@
+diff --git a/nqptp-utilities.c b/nqptp-utilities.c
+index 1181d76..3c4a3ce 100644
+--- a/nqptp-utilities.c
++++ b/nqptp-utilities.c
+@@ -74,6 +74,10 @@ void open_sockets_at_port(const char *node, uint16_t port,
+ 
+     // Handle socket open failures if protocol unavailable (or IPV6 not handled)
+     if (fd != -1) {
++      setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
++#ifdef SO_REUSEPORT
++      setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
++#endif
+ #ifdef IPV6_V6ONLY
+       // some systems don't support v4 access on v6 sockets, but some do.
+       // since we need to account for two sockets we might as well

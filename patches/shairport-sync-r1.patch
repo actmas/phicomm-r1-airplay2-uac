@@ -1,0 +1,627 @@
+diff --git a/ap2_buffered_audio_processor.c b/ap2_buffered_audio_processor.c
+index c9fb19b..131fa61 100644
+--- a/ap2_buffered_audio_processor.c
++++ b/ap2_buffered_audio_processor.c
+@@ -584,7 +584,8 @@ void *rtp_buffered_audio_processor(void *arg) {
+           // calculate the lead time to make sure it's not too early...
+           int64_t lead_time = buffer_should_be_time - get_absolute_time_in_ns();
+           if ((play_enabled != 0) &&
+-              (lead_time * 1E-9 < (config.audio_decoded_buffer_desired_length + 0.1))) {
++              ((lead_time * 1E-9 < (config.audio_decoded_buffer_desired_length + 0.2)) ||
++               (lead_time * 1E-9 > 5.0))) {
+             //            && (audio_decoded_buffer_below_desired_length != 0)
+             very_early_packets_signalled = 0; // reset very early packet warning signaller
+ 
+diff --git a/audio_pipe.c b/audio_pipe.c
+index c776305..4312369 100644
+--- a/audio_pipe.c
++++ b/audio_pipe.c
+@@ -48,6 +48,10 @@ static unsigned int bytes_per_frame = 0;
+ char *pipename = NULL;
+ char *default_pipe_name = "/tmp/shairport-sync-audio";
+ 
++#ifndef F_SETPIPE_SZ
++#define F_SETPIPE_SZ 1031
++#endif
++
+ static int prepare() {
+   int result = 0;
+   // this will leave fd as -1 if a reader hasn't been attached to the pipe
+@@ -56,6 +60,9 @@ static int prepare() {
+   // open for reading."
+ 
+   fd = try_to_open_pipe_for_writing(pipename);
++  if (fd >= 0) {
++    fcntl(fd, F_SETPIPE_SZ, 524288);
++  }
+   // we check that it's not a "real" error. From the "man 2 open" page:
+   // "ENXIO  O_NONBLOCK | O_WRONLY is set, the named file is a FIFO, and no process has the FIFO
+   // open for reading." Which is okay.
+@@ -78,6 +85,9 @@ static int play(void *buf, int samples, __attribute__((unused)) int sample_type,
+   char errorstring[1024];
+   if (fd == -1) {
+     fd = try_to_open_pipe_for_writing(pipename);
++    if (fd >= 0) {
++      fcntl(fd, F_SETPIPE_SZ, 524288);
++    }
+   }
+   // if it's got a reader, write to it.
+   if (fd > 0) {
+@@ -111,11 +121,8 @@ static int init(int argc, char **argv) {
+ 
+   // get settings from settings file, passing in defaults for format_set, rate_set and channel_set
+   // Note, these options may be in the "general" stanza or the named stanza
+-#ifdef CONFIG_AIRPLAY_2
+-  parse_audio_options("pipe", (1 << SPS_FORMAT_S32_LE), (1 << SPS_RATE_48000), (1 << 2));
+-#else
+-  parse_audio_options("pipe", (1 << SPS_FORMAT_S16_LE), (1 << SPS_RATE_44100), (1 << 2));
+-#endif
++  parse_audio_options("pipe", (1 << SPS_FORMAT_S16_LE),
++                      (1 << SPS_RATE_48000) | (1 << SPS_RATE_44100), (1 << 2));
+   if (config.cfg != NULL) {
+     /* Get the Output Pipename. */
+     const char *str;
+diff --git a/bonjour_strings.c b/bonjour_strings.c
+index eae9121..4923a2f 100644
+--- a/bonjour_strings.c
++++ b/bonjour_strings.c
+@@ -115,8 +115,8 @@ void build_bonjour_strings(__attribute((unused)) rtsp_conn_info *conn) {
+     txt_records[entry_number++] = "vn=65537";
+     txt_records[entry_number++] =
+         bnprintf(ap1SrcversString, sizeof(ap1SrcversString), "vs=%s", config.srcvers);
+-    // txt_records[entry_number++] =
+-    //     bnprintf(ap1OsversString, sizeof(ap1OsversString), "ov=%s", config.osvers);
++    txt_records[entry_number++] =
++        bnprintf(ap1OsversString, sizeof(ap1OsversString), "ov=%s", config.osvers);
+     txt_records[entry_number++] = NULL;
+   } else {
+ #endif
+@@ -196,9 +196,9 @@ void build_bonjour_strings(__attribute((unused)) rtsp_conn_info *conn) {
+     secondary_txt_records[entry_number++] = pkString; // already calculated
+     secondary_txt_records[entry_number++] =
+         bnprintf(srcversString, sizeof(srcversString), "srcvers=%s", config.srcvers);
+-    // secondary_txt_records[entry_number++] =
+-    //     bnprintf(osversString, sizeof(osversString), "osvers=%s", config.osvers);
+-    // secondary_txt_records[entry_number++] = "vv=2";
++    secondary_txt_records[entry_number++] =
++        bnprintf(osversString, sizeof(osversString), "osvers=%s", config.osvers);
++    secondary_txt_records[entry_number++] = "vv=2";
+     secondary_txt_records[entry_number++] = fwString; // already calculated
+   }
+ #endif
+diff --git a/configure.ac b/configure.ac
+index 81db6e0..1523622 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -183,7 +183,7 @@ if test "x${with_ssl}" = xopenssl ; then
+ elif test "x${with_ssl}" = xmbedtls ; then
+ 	AC_DEFINE([CONFIG_MBEDTLS], 1, [Use the mbed TLS libraries for encryption and encoding and decoding])
+ 	AC_CHECK_LIB([mbedtls],[mbedtls_ssl_init],,
+-		[AC_MSG_ERROR([mbed tls support requires the mbedtls library -- libmbedtls-dev suggested],1)])
++		[AC_MSG_ERROR([mbed tls support requires the mbedtls library -- libmbedtls-dev suggested],1)], [-lmbedx509 -lmbedcrypto])
+ 	# Mbed TLS 4 provides the crypto in libtfpsacrypto (TF-PSA-Crypto)
+ 	AC_SEARCH_LIBS([mbedtls_md_setup], [tfpsacrypto mbedcrypto],,
+ 	            [AC_MSG_ERROR([mbed tls support requires the mbedcrypto library (tfpsacrypto with Mbed TLS 4) -- libmbedcrypto0 suggested],1)])
+diff --git a/mdns_tinysvcmdns.c b/mdns_tinysvcmdns.c
+index 2a5e313..269ed2e 100644
+--- a/mdns_tinysvcmdns.c
++++ b/mdns_tinysvcmdns.c
+@@ -39,9 +39,9 @@
+ 
+ static struct mdnsd *svr = NULL;
+ 
+-static int mdns_tinysvcmdns_register(char *ap1name, __attribute__((unused)) char *ap2name, int port,
+-                                     __attribute__((unused)) char **txt_records,
+-                                     __attribute__((unused)) char **secondary_txt_records) {
++static int mdns_tinysvcmdns_register(char *ap1name, char *ap2name, int port,
++                                     char **txt_records,
++                                     char **secondary_txt_records) {
+   struct ifaddrs *ifalist;
+   struct ifaddrs *ifa;
+ 
+@@ -58,10 +58,15 @@ static int mdns_tinysvcmdns_register(char *ap1name, __attribute__((unused)) char
+   // according to POSIX, this may be truncated without a final NULL !
+   hostname[99] = 0;
+ 
+-  // will not work if the hostname doesn't end in .local
+-  char *hostend = hostname + strlen(hostname);
+-  if ((strlen(hostname) < strlen(".local")) || (strcmp(hostend - 6, ".local") != 0)) {
+-    strcat(hostname, ".local");
++  if (strncmp(hostname, "localhost", 9) == 0 || strlen(hostname) == 0) {
++    snprintf(hostname, sizeof(hostname), "Phicomm-R1-%02x%02x%02x.local",
++             config.hw_addr[3], config.hw_addr[4], config.hw_addr[5]);
++  } else {
++    // will not work if the hostname doesn't end in .local
++    char *hostend = hostname + strlen(hostname);
++    if ((strlen(hostname) < strlen(".local")) || (strcmp(hostend - 6, ".local") != 0)) {
++      strcat(hostname, ".local");
++    }
+   }
+ 
+   if (getifaddrs(&ifalist) < 0) {
+@@ -85,9 +90,10 @@ static int mdns_tinysvcmdns_register(char *ap1name, __attribute__((unused)) char
+       } else if (!(ifa->ifa_flags & IFF_LOOPBACK) && ifa->ifa_addr &&
+                  ifa->ifa_addr->sa_family == AF_INET6) {
+         struct in6_addr *addr = &((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
+-
+-        mdnsd_set_hostname_v6(svr, hostname, addr); // TTL should be 120 seconds
+-        break;
++        if (!IN6_IS_ADDR_LINKLOCAL(addr)) {
++          mdnsd_set_hostname_v6(svr, hostname, addr); // TTL should be 120 seconds
++          break;
++        }
+       }
+     }
+   }
+@@ -113,9 +119,11 @@ static int mdns_tinysvcmdns_register(char *ap1name, __attribute__((unused)) char
+       } break;
+       case AF_INET6: { // ipv6
+         struct in6_addr *addr = &((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr;
+-        struct rr_entry *aaaa_e =
+-            rr_create_aaaa(create_nlabel(hostname), addr); // TTL should be 120 seconds
+-        mdnsd_add_rr(svr, aaaa_e);
++        if (!IN6_IS_ADDR_LINKLOCAL(addr)) {
++          struct rr_entry *aaaa_e =
++              rr_create_aaaa(create_nlabel(hostname), addr); // TTL should be 120 seconds
++          mdnsd_add_rr(svr, aaaa_e);
++        }
+       } break;
+       }
+     }
+@@ -138,6 +146,9 @@ static int mdns_tinysvcmdns_register(char *ap1name, __attribute__((unused)) char
+ 
+     txt = txtwithoutmetadata;
+ 
++  if (txt_records != NULL)
++    txt = txt_records;
++
+   if (config.regtype == NULL)
+     die("tinysvcmdns: regtype is null");
+ 
+@@ -156,6 +167,19 @@ static int mdns_tinysvcmdns_register(char *ap1name, __attribute__((unused)) char
+ 
+   free(extendedregtype);
+ 
++  if ((config.regtype2 != NULL) && (ap2name != NULL) && (secondary_txt_records != NULL)) {
++    char *extendedregtype2 = malloc(strlen(config.regtype2) + strlen(".local") + 1);
++    if (extendedregtype2 != NULL) {
++      strcpy(extendedregtype2, config.regtype2);
++      strcat(extendedregtype2, ".local");
++      struct mdns_service *svc2 =
++          mdnsd_register_svc(svr, ap2name, extendedregtype2, port, NULL,
++                             (const char **)secondary_txt_records);
++      mdns_service_destroy(svc2);
++      free(extendedregtype2);
++    }
++  }
++
+   return 0;
+ }
+ 
+diff --git a/plists/get_info_response.xml b/plists/get_info_response.xml
+index 558ff60..defe66e 100644
+--- a/plists/get_info_response.xml
++++ b/plists/get_info_response.xml
+@@ -46,13 +46,13 @@
+ 		<!-- 0x00000400000 is AAC-LC/44.1K/F24/2 -->
+ 		<!-- 0x00000200000 is ALAC/48K/F24/2 -->
+ 
+-	</dict>
++	<!-- </dict> -->
+ 	<!-- <key>sourceVersion</key> --> <!-- added programmatically -->
+ 	<!-- <string>620.8.2</string> -->
+ 	<!-- <key>macAddress</key> --> <!-- hoping we don't need this -->
+ 	<!-- <string>b8:27:eb:82:d0:87</string> -->
+-	<key>receiverHDRCapability</key>
+-	<string>4k60</string>
++	<!-- <key>receiverHDRCapability</key> -->
++	<!-- <string>4k60</string> -->
+ 	<!-- key values for initialVolume, vv, volumeControlType, sourceVersion, deviceID, features, pi, name, model, featuresEx and a txtAirPlay data field are added programatically -->
+ 	<!-- key values for firmwareBuildDate (string), build (string) and PTPInfo (string)
+ 	 should be added programatically -->
+diff --git a/rtsp.c b/rtsp.c
+index d8985b5..ff40ba8 100644
+--- a/rtsp.c
++++ b/rtsp.c
+@@ -1163,10 +1163,10 @@ void generateTxtDataValueInfo(rtsp_conn_info *conn, void **response, size_t *res
+           &qualifier_response_data, &qualifier_response_data_length) == 0)
+     debug(1, "Problem");
+ 
+-  // if (add_pstring_to_malloc(bnprintf(localString, sizeof(localString), "osvers=%s",
+-  // config.osvers),
+-  //                           &qualifier_response_data, &qualifier_response_data_length) == 0)
+-  //   debug(1, "Problem");
++  if (add_pstring_to_malloc(bnprintf(localString, sizeof(localString), "osvers=%s",
++  config.osvers),
++                            &qualifier_response_data, &qualifier_response_data_length) == 0)
++    debug(1, "Problem");
+ 
+   if (add_pstring_to_malloc(bnprintf(localString, sizeof(localString), "vv=%u", config.vv),
+                             &qualifier_response_data, &qualifier_response_data_length) == 0)
+@@ -1210,15 +1210,14 @@ plist_t generateInfoPlist(rtsp_conn_info *conn) {
+     // Local volume handling must not affect the volume capability advertised to the sender.
+     plist_dict_set_item(response_plist, "volumeControlType",
+                         plist_new_uint(config.volumeControlType));
++    plist_dict_set_item(response_plist, "sourceVersion", plist_new_string(config.srcvers));
+     pthread_cleanup_pop(1); // release the principal_conn lock
+     // Create a dictionary of supported formats for the bufferStream
+     uint64_t bufferStreamFormats = 0L;
+     // bufferStreamFormats = 0xF7FE000E00000000; // don't know what these do (from the HPm)
+     plist_t supported_formats_plist = plist_new_dict();
+     if (supported_formats_plist != NULL) {
+-      // plist_dict_set_item(supported_formats_plist, "audioStream", plist_new_uint(21235712));
+-      plist_dict_set_item(supported_formats_plist, "audioStream",
+-                          plist_new_uint(262144)); // just ALAC/S16/2
++      plist_dict_set_item(supported_formats_plist, "audioStream", plist_new_uint(21235712)); // AAC-LC, ALAC, PCM
+ 
+       {
+         bufferStreamFormats |= 0x00000400000L; // AAC-LC/44.1K/F24/2
+@@ -2095,6 +2094,7 @@ void handle_feedback(rtsp_conn_info *conn, __attribute__((unused)) rtsp_message
+     connection_number = principal_conn->connection_number;
+     type = principal_conn->type;
+     rate = 1.0 * principal_conn->input_rate;
++    if (rate == 0.0) rate = 48000.0;
+   }
+   pthread_cleanup_pop(1); // release the principal_conn lock
+ 
+diff --git a/shairport.c b/shairport.c
+index 7a06caa..64b10b5 100644
+--- a/shairport.c
++++ b/shairport.c
+@@ -42,6 +42,43 @@
+ #include <sys/wait.h>
+ #include <unistd.h>
+ 
++/* Android 5.1 / Linux 3.10 compatibility for getentropy() and getrandom() */
++ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
++  (void)flags;
++  int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
++  if (fd < 0)
++    return -1;
++  size_t total = 0;
++  while (total < buflen) {
++    ssize_t n = read(fd, (char *)buf + total, buflen - total);
++    if (n < 0) {
++      if (errno == EINTR)
++        continue;
++      close(fd);
++      return -1;
++    }
++    if (n == 0)
++      break;
++    total += n;
++  }
++  close(fd);
++  return (ssize_t)total;
++}
++
++int getentropy(void *buffer, size_t length) {
++  if (length > 256) {
++    errno = EIO;
++    return -1;
++  }
++  ssize_t ret = getrandom(buffer, length, 0);
++  if (ret != (ssize_t)length) {
++    if (ret >= 0)
++      errno = EIO;
++    return -1;
++  }
++  return 0;
++}
++
+ 
+ #ifdef CONFIG_FFMPEG
+ #include <libavutil/log.h>
+@@ -612,7 +649,7 @@ int parse_options(int argc, char **argv) {
+                                 // player. 0 -- 4. 3 seems normal.
+ #endif
+ 
+-  config.vv = 0;
++  config.vv = 2;
+ 
+   // make up a firmware version
+ #ifdef CONFIG_USE_GIT_VERSION_STRING
+@@ -1948,17 +1985,18 @@ int parse_options(int argc, char **argv) {
+   // 496155702020608 this setting here is the source of both the plist features response and the
+   // mDNS string.
+ 
+-  config.airplay_features = 0x00010340401C4A00; // no AP2 metadata (b50), no AP1 text (b17), no AP1
+-                                                // progress (b16), no AP1 artwork (b15)
+-                                                // no HomeKit Pairing ability
++  config.airplay_features = 0x00010340401C4A00; // base AP2 features
++
++  // Bit 47 is needed for AirPlay 2 timing/streaming.
++  // DO NOT set Bit 46 (SupportsHKPairingAndAccessControl) as it forces iOS
++  // to require Apple HomeKit pairing/access control, which blocks iPhone connections!
++  config.airplay_features |= ((uint64_t)1 << 47);
+ 
+-  // These are important for allowing Shairport Sync to be added to Apple home.
+-  config.airplay_features |= (((uint64_t)1 << 46) | ((uint64_t)1 << 47));
+-  // Bit 46 seems to mean	SupportsHKPairingAndAccessControl	HomeKit-based pairing and
+-  // access control support Bit 47 seems necessary too, but is undocumented.
++  // Bit 22 is set on Airport Express and working AirPlay 2 receivers
++  config.airplay_features |= ((uint64_t)1 << 22);
+ 
+-  // This is undocumented, but is set on the APX.
+-  // config.airplay_features |= (uint64_t)1 << 22 ;
++  // Classic metadata support bits (15, 16, 17)
++  config.airplay_features |= (((uint64_t)1 << 15) | ((uint64_t)1 << 16) | ((uint64_t)1 << 17));
+ 
+   // debug(1, "Features: 0x%" PRIx64 ", unmask: 0x%" PRIx64 ", mask: 0x%" PRIx64 ".",
+   // config.airplay_features, unmask, mask);
+@@ -2673,6 +2711,8 @@ const char *av_channel_layout_name(uint64_t channel_layout) {
+ #endif
+ 
+ int main(int argc, char **argv) {
++  setvbuf(stdout, NULL, _IOLBF, 0);
++  setvbuf(stderr, NULL, _IONBF, 0);
+   exit_init(); // initialise the exit handler to give us a clean safe exit on request
+   // initialise debug messages stuff -- level 0, no elapsed time, relative time, file and line
+   // debug_init(int level, int show_elapsed_time, int show_relative_time, int show_file_and_line)
+diff --git a/tinysvcmdns.c b/tinysvcmdns.c
+index 43c86d8..8ec2be0 100644
+--- a/tinysvcmdns.c
++++ b/tinysvcmdns.c
+@@ -36,7 +36,7 @@
+ #include "common.h"
+ #include "utilities/network_utilities.h"
+ 
+-#define DEBUG_PRINTF(...) debug(3, __VA_ARGS__)
++#define DEBUG_PRINTF(...) debug(1, __VA_ARGS__)
+ #define log_message(level, ...)                                                                    \
+   do {                                                                                             \
+     switch (level) {                                                                               \
+@@ -209,6 +209,27 @@ uint8_t *create_label(const char *txt) {
+   return s;
+ }
+ 
++uint8_t *create_txt_label(const char *txt) {
++  int len;
++  uint8_t *s;
++
++  if (txt == NULL)
++    return NULL;
++  len = strlen(txt);
++  if (len > 255)
++    len = 255;
++
++  s = malloc(len + 2);
++  if (s) {
++    s[0] = len;
++    memcpy((char *)s + 1, txt, len);
++    s[len + 1] = '\0';
++  } else {
++    die("can not allocate memory for \"s\" in create_txt_label.");
++  }
++  return s;
++}
++
+ // creates a uncompressed name label given a DNS name like "apple.b.com"
+ // free() after use
+ uint8_t *create_nlabel(const char *name) {
+@@ -545,7 +566,7 @@ void rr_add_txt(struct rr_entry *rr_txt, const char *txt) {
+ 
+   // is current data filled?
+   if (txt_rec->txt == NULL) {
+-    txt_rec->txt = create_label(txt);
++    txt_rec->txt = create_txt_label(txt);
+     return;
+   }
+ 
+@@ -557,7 +578,7 @@ void rr_add_txt(struct rr_entry *rr_txt, const char *txt) {
+   txt_rec->next = malloc(sizeof(struct rr_data_txt));
+ 
+   txt_rec = txt_rec->next;
+-  txt_rec->txt = create_label(txt);
++  txt_rec->txt = create_txt_label(txt);
+   txt_rec->next = NULL;
+ }
+ 
+@@ -1023,9 +1044,11 @@ static size_t mdns_encode_rr(uint8_t *pkt_buf, size_t pkt_len, size_t off, struc
+   case RR_TXT:
+     txt_rec = &rr->data.TXT;
+     for (; txt_rec; txt_rec = txt_rec->next) {
+-      int len = txt_rec->txt[0] + 1;
+-      strncpy((char *)p, (char *)txt_rec->txt, len);
+-      p += len;
++      if (txt_rec->txt) {
++        int len = txt_rec->txt[0] + 1;
++        memcpy((char *)p, (char *)txt_rec->txt, len);
++        p += len;
++      }
+     }
+     break;
+ 
+@@ -1158,6 +1181,8 @@ size_t mdns_encode_pkt(struct mdns_pkt *answer, uint8_t *pkt_buf, size_t pkt_len
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <unistd.h>
++#include <ifaddrs.h>
++#include <net/if.h>
+ 
+ /*
+  * Define a proper IP socket level if not already done.
+@@ -1206,6 +1231,15 @@ static int create_recv_sock() {
+     log_message(LOG_ERR, "recv setsockopt(SO_REUSEADDR): %m");
+     return r;
+   }
++#ifdef SO_REUSEPORT
++  setsockopt(sd, SOL_SOCKET, SO_REUSEPORT, (char *)&on, sizeof(on));
++#endif
++
++  // Bind to wlan0 if present for reliable Android routing
++  struct ifreq ifr;
++  memset(&ifr, 0, sizeof(ifr));
++  strncpy(ifr.ifr_name, "wlan0", IFNAMSIZ - 1);
++  setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, (char *)&ifr, sizeof(ifr));
+ 
+   /* bind to an address */
+   struct sockaddr_in serveraddr;
+@@ -1217,16 +1251,35 @@ static int create_recv_sock() {
+     log_message(LOG_ERR, "recv bind(): %m");
+   }
+ 
++  // Find non-loopback IP for multicast interface
++  struct in_addr if_addr;
++  if_addr.s_addr = htonl(INADDR_ANY);
++  struct ifaddrs *ifalist = NULL;
++  if (getifaddrs(&ifalist) == 0) {
++    for (struct ifaddrs *ifa = ifalist; ifa != NULL; ifa = ifa->ifa_next) {
++      if (!(ifa->ifa_flags & IFF_LOOPBACK) && (ifa->ifa_flags & IFF_UP) && ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
++        if_addr = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
++        break;
++      }
++    }
++    freeifaddrs(ifalist);
++  }
++
+   // add membership to receiving socket
+   struct ip_mreq mreq;
+   memset(&mreq, 0, sizeof(struct ip_mreq));
+-  mreq.imr_interface.s_addr = htonl(INADDR_ANY);
++  mreq.imr_interface = if_addr;
+   mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
+   if ((r = setsockopt(sd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq))) < 0) {
+-    log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %m");
+-    return r;
++    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
++    setsockopt(sd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq));
+   }
+ 
++  // Explicitly set multicast output interface and TTL
++  setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, (char *)&if_addr, sizeof(if_addr));
++  unsigned char ttl = 255;
++  setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
++
+   // enable loopback in case someone else needs the data
+   if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, (char *)&on, sizeof(on))) < 0) {
+     log_message(LOG_ERR, "recv setsockopt(IP_MULTICAST_LOOP): %m");
+@@ -1281,6 +1334,15 @@ static int populate_answers(struct mdnsd *svr, struct rr_list **rr_head, uint8_t
+     }
+   }
+ 
++  // If AAAA query on an IPv4-only host, return the A record and NSEC so client resolves IPv4 immediately without hanging!
++  if (num_ans == 0 && type == RR_AAAA) {
++    for (n = ans_grp->rr; n; n = n->next) {
++      if ((n->e->type == RR_A || n->e->type == RR_NSEC) && cmp_nlabel(name, n->e->name) == 0) {
++        num_ans += rr_list_append(rr_head, n->e);
++      }
++    }
++  }
++
+   pthread_mutex_unlock(&svr->data_lock);
+ 
+   return num_ans;
+@@ -1359,12 +1421,7 @@ static int process_mdns_pkt(struct mdnsd *svr, struct mdns_pkt *pkt, struct mdns
+                    namestr);
+       free(namestr);
+ 
+-      // check if it's a unicast query - we ignore those
+-      if (qn->unicast_query) {
+-        DEBUG_PRINTF("skipping unicast query\n");
+-        continue;
+-      }
+-
++      // Apple mDNS clients set the QU bit (unicast_query) - we MUST answer them!
+       num_ans_added = populate_answers(svr, &reply->rr_ans, qn->name, qn->type);
+       reply->num_ans_rr += num_ans_added;
+ 
+@@ -1408,7 +1465,7 @@ static int process_mdns_pkt(struct mdnsd *svr, struct mdns_pkt *pkt, struct mdns
+ 
+     DEBUG_PRINTF("\n");
+ 
+-    return reply->num_ans_rr;
++    return (reply->num_ans_rr + reply->num_add_rr);
+   }
+ 
+   return 0;
+@@ -1505,40 +1562,53 @@ void *main_loop(struct mdnsd *svr) {
+   else
+     die("could not allocate memory for \"mdns_reply\" in tinysvcmdns");
+ 
++  time_t last_reannounce = time(NULL);
+   while (!svr->stop_flag) {
+     FD_ZERO(&sockfd_set);
+     FD_SET(svr->sockfd, &sockfd_set);
+     FD_SET(svr->notify_pipe[0], &sockfd_set);
+-    select(max_fd + 1, &sockfd_set, NULL, NULL, NULL);
++    struct timeval tv;
++    tv.tv_sec = 5;
++    tv.tv_usec = 0;
++    select(max_fd + 1, &sockfd_set, NULL, NULL, &tv);
+ 
+     if (FD_ISSET(svr->notify_pipe[0], &sockfd_set)) {
+       // flush the notify_pipe
+       read_pipe(svr->notify_pipe[0], (char *)&notify_buf, 1);
+-    } else if (FD_ISSET(svr->sockfd, &sockfd_set)) {
++    }
++    if (FD_ISSET(svr->sockfd, &sockfd_set)) {
+       struct sockaddr_in fromaddr;
+       socklen_t sockaddr_size = sizeof(struct sockaddr_in);
+ 
+       ssize_t recvsize = recvfrom(svr->sockfd, pkt_buffer, PACKET_SIZE, 0,
+                                   (struct sockaddr *)&fromaddr, &sockaddr_size);
+-      if (recvsize < 0) {
+-        log_message(LOG_ERR, "recv(): %m");
+-        // recvsize is passed to mdns_parse_pkt() as a size_t; a negative value
+-        // would become huge and defeat every bounds check. Skip this datagram.
+-        continue;
+-      }
+-
+-      DEBUG_PRINTF("data from=%s size=%ld\n", inet_ntoa(fromaddr.sin_addr), (long)recvsize);
+-      struct mdns_pkt *mdns = mdns_parse_pkt(pkt_buffer, recvsize);
+-      if (mdns != NULL) {
+-        if (process_mdns_pkt(svr, mdns, mdns_reply)) {
+-          size_t replylen = mdns_encode_pkt(mdns_reply, pkt_buffer, PACKET_SIZE);
+-          send_packet(svr->sockfd, pkt_buffer, replylen);
+-        } else if (mdns->num_qn == 0) {
+-          DEBUG_PRINTF("(no questions in packet)\n\n");
++      if (recvsize >= 0) {
++        DEBUG_PRINTF("data from=%s size=%ld\n", inet_ntoa(fromaddr.sin_addr), (long)recvsize);
++        struct mdns_pkt *mdns = mdns_parse_pkt(pkt_buffer, recvsize);
++        if (mdns != NULL) {
++          if (process_mdns_pkt(svr, mdns, mdns_reply)) {
++            size_t replylen = mdns_encode_pkt(mdns_reply, pkt_buffer, PACKET_SIZE);
++            send_packet(svr->sockfd, pkt_buffer, replylen);
++            sendto(svr->sockfd, pkt_buffer, replylen, 0, (struct sockaddr *)&fromaddr, sizeof(fromaddr));
++          } else if (mdns->num_qn == 0) {
++            DEBUG_PRINTF("(no questions in packet)\n\n");
++          }
++
++          mdns_pkt_destroy(mdns);
+         }
++      }
++    }
+ 
+-        mdns_pkt_destroy(mdns);
++    // Refresh mDNS announcements every 25 seconds (TTL is 120s)
++    time_t now = time(NULL);
++    if (now - last_reannounce >= 25) {
++      last_reannounce = now;
++      pthread_mutex_lock(&svr->data_lock);
++      struct rr_list *svc_le = svr->services;
++      for (; svc_le; svc_le = svc_le->next) {
++        rr_list_append(&svr->announce, svc_le->e);
+       }
++      pthread_mutex_unlock(&svr->data_lock);
+     }
+ 
+     // send out announces
+diff --git a/xml_plist_codegen.sh b/xml_plist_codegen.sh
+index 3c8f5ad..55a99fa 100644
+--- a/xml_plist_codegen.sh
++++ b/xml_plist_codegen.sh
+@@ -23,6 +23,12 @@ printf "// Please do not edit this file!\n" > $2/$BASE_FILENAME.c
+ printf "// This file was automatically generated from $INPUT_FILE_NAME.\n\n" >> $2/$BASE_FILENAME.c
+ printf "#include \"$BASE_FILENAME.h\"\n\n" >> $2/$BASE_FILENAME.c
+ printf "unsigned char ${BASE_FILENAME}_plist[] = {\n" >> $2/$BASE_FILENAME.c
+-plistutil -i $1 | xxd -i >> $2/$BASE_FILENAME.c
++if command -v plistutil >/dev/null 2>&1; then
++    plistutil -i $1 | xxd -i >> $2/$BASE_FILENAME.c
++elif command -v plutil >/dev/null 2>&1; then
++    plutil -convert binary1 -o - $1 | xxd -i >> $2/$BASE_FILENAME.c
++else
++    python3 -c "import plistlib, sys; sys.stdout.buffer.write(plistlib.dumps(plistlib.load(open(sys.argv[1], 'rb')), fmt=plistlib.FMT_BINARY))" $1 | xxd -i >> $2/$BASE_FILENAME.c
++fi
+ printf "  };\n\n" >> $2/$BASE_FILENAME.c
+ printf "size_t ${BASE_FILENAME}_plist_len = sizeof(${BASE_FILENAME}_plist);\n" >> $2/$BASE_FILENAME.c

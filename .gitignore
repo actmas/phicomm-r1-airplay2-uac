@@ -1,0 +1,16 @@
+# Build artifacts & intermediate files
+*.o
+*.ko
+.verify_flash.bin
+.DS_Store
+
+# Large local toolchain & upstream working trees (see patches/ for R1-specific diffs)
+toolchain/
+shairport-sync/
+nqptp/
+
+# Personal backups & logs
+log/
+boot_airplay.img
+boot-original.bin
+bin/shairport-sync-bin
