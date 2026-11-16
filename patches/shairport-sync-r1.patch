@@ -220,7 +220,7 @@ index 558ff60..defe66e 100644
  	<!-- key values for firmwareBuildDate (string), build (string) and PTPInfo (string)
  	 should be added programatically -->
 diff --git a/rtsp.c b/rtsp.c
-index d8985b5..ff40ba8 100644
+index d8985b5..e3febed 100644
 --- a/rtsp.c
 +++ b/rtsp.c
 @@ -1163,10 +1163,10 @@ void generateTxtDataValueInfo(rtsp_conn_info *conn, void **response, size_t *res
@@ -264,6 +264,18 @@ index d8985b5..ff40ba8 100644
    }
    pthread_cleanup_pop(1); // release the principal_conn lock
  
+@@ -4056,6 +4056,11 @@ void rtsp_conversation_thread_cleanup_function(void *arg) {
+       conn->rtp_event_thread = NULL;
+     }
+     conn->ap2_event_receiver_exited = 0;
++    if (conn->event_socket > 0) {
++      debug(3, "Connection %d: terminating -- closing event_socket %d.", conn->connection_number,
++            conn->event_socket);
++      safe_socket_close(&conn->event_socket);
++    }
+     debug(3, "Connection %d: %s event thread deleted.", conn->connection_number,
+           get_category_string(conn->airplay_stream_category));
+ #endif
 diff --git a/shairport.c b/shairport.c
 index 7a06caa..64b10b5 100644
 --- a/shairport.c
@@ -359,7 +371,7 @@ index 7a06caa..64b10b5 100644
    // initialise debug messages stuff -- level 0, no elapsed time, relative time, file and line
    // debug_init(int level, int show_elapsed_time, int show_relative_time, int show_file_and_line)
 diff --git a/tinysvcmdns.c b/tinysvcmdns.c
-index 43c86d8..8ec2be0 100644
+index 43c86d8..82aa16f 100644
 --- a/tinysvcmdns.c
 +++ b/tinysvcmdns.c
 @@ -36,7 +36,7 @@
@@ -371,7 +383,23 @@ index 43c86d8..8ec2be0 100644
  #define log_message(level, ...)                                                                    \
    do {                                                                                             \
      switch (level) {                                                                               \
-@@ -209,6 +209,27 @@ uint8_t *create_label(const char *txt) {
+@@ -63,6 +63,15 @@
+ #else
+ #include <netinet/in.h>
+ #endif
++#ifdef __linux__
++#include <arpa/inet.h>
++#include <linux/if_ether.h>
++#include <linux/if_packet.h>
++#include <net/if.h>
++#include <sys/ioctl.h>
++#include <sys/socket.h>
++#include <time.h>
++#endif
+ 
+ // See RFC 6762 Section 10 for an account of two TTLs -- 120 seconds for rrs with a host name as the
+ // record's name
+@@ -209,6 +218,27 @@ uint8_t *create_label(const char *txt) {
    return s;
  }
  
@@ -399,7 +427,7 @@ index 43c86d8..8ec2be0 100644
  // creates a uncompressed name label given a DNS name like "apple.b.com"
  // free() after use
  uint8_t *create_nlabel(const char *name) {
-@@ -545,7 +566,7 @@ void rr_add_txt(struct rr_entry *rr_txt, const char *txt) {
+@@ -545,7 +575,7 @@ void rr_add_txt(struct rr_entry *rr_txt, const char *txt) {
  
    // is current data filled?
    if (txt_rec->txt == NULL) {
@@ -408,7 +436,7 @@ index 43c86d8..8ec2be0 100644
      return;
    }
  
-@@ -557,7 +578,7 @@ void rr_add_txt(struct rr_entry *rr_txt, const char *txt) {
+@@ -557,7 +587,7 @@ void rr_add_txt(struct rr_entry *rr_txt, const char *txt) {
    txt_rec->next = malloc(sizeof(struct rr_data_txt));
  
    txt_rec = txt_rec->next;
@@ -417,7 +445,7 @@ index 43c86d8..8ec2be0 100644
    txt_rec->next = NULL;
  }
  
-@@ -1023,9 +1044,11 @@ static size_t mdns_encode_rr(uint8_t *pkt_buf, size_t pkt_len, size_t off, struc
+@@ -1023,9 +1053,11 @@ static size_t mdns_encode_rr(uint8_t *pkt_buf, size_t pkt_len, size_t off, struc
    case RR_TXT:
      txt_rec = &rr->data.TXT;
      for (; txt_rec; txt_rec = txt_rec->next) {
@@ -432,7 +460,7 @@ index 43c86d8..8ec2be0 100644
      }
      break;
  
-@@ -1158,6 +1181,8 @@ size_t mdns_encode_pkt(struct mdns_pkt *answer, uint8_t *pkt_buf, size_t pkt_len
+@@ -1158,6 +1190,8 @@ size_t mdns_encode_pkt(struct mdns_pkt *answer, uint8_t *pkt_buf, size_t pkt_len
  #include <sys/stat.h>
  #include <sys/types.h>
  #include <unistd.h>
@@ -441,7 +469,7 @@ index 43c86d8..8ec2be0 100644
  
  /*
   * Define a proper IP socket level if not already done.
-@@ -1206,6 +1231,15 @@ static int create_recv_sock() {
+@@ -1206,6 +1240,15 @@ static int create_recv_sock() {
      log_message(LOG_ERR, "recv setsockopt(SO_REUSEADDR): %m");
      return r;
    }
@@ -457,7 +485,7 @@ index 43c86d8..8ec2be0 100644
  
    /* bind to an address */
    struct sockaddr_in serveraddr;
-@@ -1217,16 +1251,35 @@ static int create_recv_sock() {
+@@ -1217,16 +1260,35 @@ static int create_recv_sock() {
      log_message(LOG_ERR, "recv bind(): %m");
    }
  
@@ -496,7 +524,7 @@ index 43c86d8..8ec2be0 100644
    // enable loopback in case someone else needs the data
    if ((r = setsockopt(sd, IPPROTO_IP, IP_MULTICAST_LOOP, (char *)&on, sizeof(on))) < 0) {
      log_message(LOG_ERR, "recv setsockopt(IP_MULTICAST_LOOP): %m");
-@@ -1281,6 +1334,15 @@ static int populate_answers(struct mdnsd *svr, struct rr_list **rr_head, uint8_t
+@@ -1281,6 +1343,15 @@ static int populate_answers(struct mdnsd *svr, struct rr_list **rr_head, uint8_t
      }
    }
  
@@ -512,7 +540,7 @@ index 43c86d8..8ec2be0 100644
    pthread_mutex_unlock(&svr->data_lock);
  
    return num_ans;
-@@ -1359,12 +1421,7 @@ static int process_mdns_pkt(struct mdnsd *svr, struct mdns_pkt *pkt, struct mdns
+@@ -1359,12 +1430,7 @@ static int process_mdns_pkt(struct mdnsd *svr, struct mdns_pkt *pkt, struct mdns
                     namestr);
        free(namestr);
  
@@ -526,7 +554,7 @@ index 43c86d8..8ec2be0 100644
        num_ans_added = populate_answers(svr, &reply->rr_ans, qn->name, qn->type);
        reply->num_ans_rr += num_ans_added;
  
-@@ -1408,7 +1465,7 @@ static int process_mdns_pkt(struct mdnsd *svr, struct mdns_pkt *pkt, struct mdns
+@@ -1408,7 +1474,7 @@ static int process_mdns_pkt(struct mdnsd *svr, struct mdns_pkt *pkt, struct mdns
  
      DEBUG_PRINTF("\n");
  
@@ -535,7 +563,157 @@ index 43c86d8..8ec2be0 100644
    }
  
    return 0;
-@@ -1505,40 +1562,53 @@ void *main_loop(struct mdnsd *svr) {
+@@ -1487,6 +1553,149 @@ int close_pipe(int *s) {
+ #endif
+ }
+ 
++#ifdef __linux__
++static void mdns_send_arp_frame(int ps, int ifidx,
++                                const unsigned char dst_mac[6],
++                                const unsigned char src_mac[6],
++                                const unsigned char src_ip[4],
++                                const unsigned char tpa[4]) {
++  struct sockaddr_ll sll;
++  unsigned char pkt[42];
++
++  memset(&sll, 0, sizeof(sll));
++  sll.sll_family = AF_PACKET;
++  sll.sll_protocol = htons(ETH_P_ARP);
++  sll.sll_ifindex = ifidx;
++  sll.sll_halen = 6;
++  memcpy(sll.sll_addr, dst_mac, 6);
++
++  memcpy(pkt, dst_mac, 6);
++  memcpy(pkt + 6, src_mac, 6);
++  pkt[12] = 0x08;
++  pkt[13] = 0x06;
++  pkt[14] = 0x00;
++  pkt[15] = 0x01;
++  pkt[16] = 0x08;
++  pkt[17] = 0x00;
++  pkt[18] = 6;
++  pkt[19] = 4;
++  pkt[20] = 0x00;
++  pkt[21] = 0x01;
++  memcpy(pkt + 22, src_mac, 6);
++  memcpy(pkt + 28, src_ip, 4);
++  memset(pkt + 32, 0x00, 6);
++  memcpy(pkt + 38, tpa, 4);
++  sendto(ps, pkt, sizeof(pkt), 0, (struct sockaddr *)&sll, sizeof(sll));
++}
++
++/* Rate-limited ARP announcement + probe toward any LAN peer sending mDNS traffic,
++ * so clients whose ARP cache aged out learn R1's MAC before tapping AirPlay.
++ */
++static void mdns_send_arp_to_peer(struct in_addr peer_addr) {
++  static struct {
++    uint32_t ip;
++    time_t ts;
++  } cache[16];
++  static int next_slot = 0;
++
++  if (peer_addr.s_addr == 0 || peer_addr.s_addr == htonl(INADDR_LOOPBACK))
++    return;
++
++  time_t now = time(NULL);
++  for (int i = 0; i < 16; i++) {
++    if (cache[i].ip == peer_addr.s_addr) {
++      if (now - cache[i].ts < 15)
++        return;
++      cache[i].ts = now;
++      goto do_send;
++    }
++  }
++  cache[next_slot].ip = peer_addr.s_addr;
++  cache[next_slot].ts = now;
++  next_slot = (next_slot + 1) % 16;
++
++do_send:;
++  int ctl = socket(AF_INET, SOCK_DGRAM, 0);
++  if (ctl < 0)
++    return;
++
++  struct ifreq ifr;
++  memset(&ifr, 0, sizeof(ifr));
++  strncpy(ifr.ifr_name, "wlan0", IFNAMSIZ - 1);
++  if (ioctl(ctl, SIOCGIFINDEX, &ifr) < 0) {
++    close(ctl);
++    return;
++  }
++  int ifidx = ifr.ifr_ifindex;
++
++  memset(&ifr, 0, sizeof(ifr));
++  strncpy(ifr.ifr_name, "wlan0", IFNAMSIZ - 1);
++  if (ioctl(ctl, SIOCGIFHWADDR, &ifr) < 0) {
++    close(ctl);
++    return;
++  }
++  unsigned char my_mac[6];
++  memcpy(my_mac, ifr.ifr_hwaddr.sa_data, 6);
++
++  memset(&ifr, 0, sizeof(ifr));
++  strncpy(ifr.ifr_name, "wlan0", IFNAMSIZ - 1);
++  if (ioctl(ctl, SIOCGIFADDR, &ifr) < 0) {
++    close(ctl);
++    return;
++  }
++  unsigned char my_ip[4];
++  memcpy(my_ip, &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr, 4);
++  close(ctl);
++
++  unsigned char peer_ip[4];
++  memcpy(peer_ip, &peer_addr.s_addr, 4);
++  if (memcmp(my_ip, peer_ip, 4) == 0)
++    return;
++
++  int ps = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
++  if (ps < 0)
++    return;
++
++  static const unsigned char bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
++  unsigned char peer_mac[6];
++  int have_peer_mac = 0;
++
++  FILE *fp = fopen("/proc/net/arp", "r");
++  if (fp) {
++    char line[256];
++    if (fgets(line, sizeof(line), fp)) {
++      while (fgets(line, sizeof(line), fp)) {
++        char ip_str[64], hw_type[16], flags[16], mac_str[32], mask[16], dev[32];
++        if (sscanf(line, "%63s %15s %15s %31s %15s %31s",
++                   ip_str, hw_type, flags, mac_str, mask, dev) == 6 &&
++            strcmp(dev, "wlan0") == 0 && strcmp(flags, "0x0") != 0) {
++          struct in_addr entry_ip;
++          unsigned int m[6];
++          if (inet_aton(ip_str, &entry_ip) && entry_ip.s_addr == peer_addr.s_addr &&
++              sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
++                     &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
++            for (int k = 0; k < 6; k++)
++              peer_mac[k] = (unsigned char)m[k];
++            if ((peer_mac[0] | peer_mac[1] | peer_mac[2] |
++                 peer_mac[3] | peer_mac[4] | peer_mac[5]) != 0)
++              have_peer_mac = 1;
++            break;
++          }
++        }
++      }
++    }
++    fclose(fp);
++  }
++
++  if (have_peer_mac) {
++    mdns_send_arp_frame(ps, ifidx, peer_mac, my_mac, my_ip, peer_ip);
++  }
++  mdns_send_arp_frame(ps, ifidx, bcast, my_mac, my_ip, peer_ip);
++  mdns_send_arp_frame(ps, ifidx, bcast, my_mac, my_ip, my_ip);
++  close(ps);
++}
++#endif
++
+ // main loop to receive, process and send out MDNS replies
+ // also handles MDNS service announces
+ void *main_loop(struct mdnsd *svr) {
+@@ -1505,40 +1714,56 @@ void *main_loop(struct mdnsd *svr) {
    else
      die("could not allocate memory for \"mdns_reply\" in tinysvcmdns");
  
@@ -578,6 +756,9 @@ index 43c86d8..8ec2be0 100644
 -          DEBUG_PRINTF("(no questions in packet)\n\n");
 +      if (recvsize >= 0) {
 +        DEBUG_PRINTF("data from=%s size=%ld\n", inet_ntoa(fromaddr.sin_addr), (long)recvsize);
++#ifdef __linux__
++        mdns_send_arp_to_peer(fromaddr.sin_addr);
++#endif
 +        struct mdns_pkt *mdns = mdns_parse_pkt(pkt_buffer, recvsize);
 +        if (mdns != NULL) {
 +          if (process_mdns_pkt(svr, mdns, mdns_reply)) {

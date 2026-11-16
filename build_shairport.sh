@@ -17,7 +17,7 @@ export STRIP="${STRIP:-arm-linux-gnueabihf-strip}"
 
 export CFLAGS="-O2 -I/usr/include/plist"
 export LDFLAGS="-static"
-export LIBS="-lssl -lcrypto"
+export LIBS="-lssl -lcrypto -lgpg-error"
 
 cd "$SCRIPT_DIR/shairport-sync"
 

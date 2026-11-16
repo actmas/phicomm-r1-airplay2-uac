@@ -74,17 +74,39 @@ void *mmap(void *, size_t, int, int, int, long);
 int munmap(void *, size_t);
 
 /* Socket API */
-#define AF_UNIX 1
-#define AF_INET 2
-#define SOCK_DGRAM 2
+#define AF_UNIX   1
+#define AF_INET   2
+#define AF_PACKET 17
 #define SOCK_STREAM 1
+#define SOCK_DGRAM  2
+#define SOCK_RAW    3
+
+#define SIOCGIFFLAGS  0x8913
+#define SIOCSIFFLAGS  0x8914
+#define SIOCGIFADDR   0x8915
+#define SIOCGIFHWADDR 0x8927
+#define SIOCGIFINDEX  0x8933
+#define IFF_ALLMULTI  0x0200
+#define ETH_P_ARP     0x0806
 
 struct sockaddr_un {
     unsigned short sun_family;
     char sun_path[108];
 };
+
+struct sockaddr_ll {
+    unsigned short sll_family;
+    unsigned short sll_protocol;
+    int sll_ifindex;
+    unsigned short sll_hatype;
+    unsigned char sll_pkttype;
+    unsigned char sll_halen;
+    unsigned char sll_addr[8];
+};
+
 int socket(int, int, int);
 int bind(int, const void *, unsigned int);
+ssize_t sendto(int, const void *, size_t, int, const void *, unsigned int);
 
 /* Poll */
 struct pollfd {
@@ -222,12 +244,12 @@ static int is_card2_externally_active(void) {
     if (n <= 0) return 0;
     return buf_has_running_state(buf, (int)n);
 }
-static int s_vol = 180;       // Default ~85% volume
+static int s_vol = 231;       // Default 0 dB unity gain on AK7755 DAC (range 0..255)
 static int s_is_muted = 0;
 static int s_last_touch_pos = -1;
 
 #define MIN_VOL 0
-#define MAX_VOL 207
+#define MAX_VOL 255
 
 /* Klog helper */
 static void klog(const char *fmt, ...) {
@@ -575,13 +597,27 @@ static void handle_key_event(struct mixer *m, int key_fd) {
 
 #define WIFI_IFNAMSIZ 16
 #define WIFI_SIOCDEVPRIVATE 0x89F0
+#define WLC_SET_PM  86
+#define WLC_SET_VAR 263
 
 struct wifi_ifreq {
     char ifr_name[WIFI_IFNAMSIZ];
     union {
         char pad[16];
+        short ifr_flags;
+        int ifr_ifindex;
+        unsigned char ifr_raw[16];
         void *ifr_data;
     };
+};
+
+struct wl_ioctl_cmd {
+    uint32_t cmd;
+    void *buf;
+    uint32_t len;
+    uint8_t set;
+    uint32_t used;
+    uint32_t needed;
 };
 
 struct android_wifi_priv_cmd {
@@ -589,6 +625,10 @@ struct android_wifi_priv_cmd {
     int used_len;
     int total_len;
 };
+
+static unsigned short htons_be16(unsigned short v) {
+    return (unsigned short)((v << 8) | (v >> 8));
+}
 
 static int wlan0_priv_cmd(int sock, const char *cmd_str) {
     struct wifi_ifreq ifr;
@@ -605,6 +645,220 @@ static int wlan0_priv_cmd(int sock, const char *cmd_str) {
     priv_cmd.total_len = sizeof(buf);
     ifr.ifr_data = &priv_cmd;
     return ioctl(sock, WIFI_SIOCDEVPRIVATE + 1, &ifr);
+}
+
+static int wlan0_wlc_set_pm(int sock, int pm) {
+    struct wifi_ifreq ifr;
+    struct wl_ioctl_cmd ioc;
+    int val = pm;
+
+    memset(&ifr, 0, sizeof(ifr));
+    memset(&ioc, 0, sizeof(ioc));
+    strncpy(ifr.ifr_name, "wlan0", WIFI_IFNAMSIZ - 1);
+    ioc.cmd = WLC_SET_PM;
+    ioc.buf = &val;
+    ioc.len = sizeof(val);
+    ioc.set = 1;
+    ifr.ifr_data = &ioc;
+    return ioctl(sock, WIFI_SIOCDEVPRIVATE, &ifr);
+}
+
+static int wlan0_wlc_set_iovar(int sock, const char *name, int val) {
+    struct wifi_ifreq ifr;
+    struct wl_ioctl_cmd ioc;
+    char buf[64];
+    size_t nlen = strlen(name) + 1;
+
+    if (nlen + sizeof(int) > sizeof(buf)) return -1;
+    memset(&ifr, 0, sizeof(ifr));
+    memset(&ioc, 0, sizeof(ioc));
+    memset(buf, 0, sizeof(buf));
+    memcpy(buf, name, nlen);
+    memcpy(buf + nlen, &val, sizeof(int));
+    strncpy(ifr.ifr_name, "wlan0", WIFI_IFNAMSIZ - 1);
+    ioc.cmd = WLC_SET_VAR;
+    ioc.buf = buf;
+    ioc.len = (uint32_t)(nlen + sizeof(int));
+    ioc.set = 1;
+    ifr.ifr_data = &ioc;
+    return ioctl(sock, WIFI_SIOCDEVPRIVATE, &ifr);
+}
+
+static void wlan0_ensure_allmulti(int sock) {
+    struct wifi_ifreq ifr;
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, "wlan0", WIFI_IFNAMSIZ - 1);
+    if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0 && !(ifr.ifr_flags & IFF_ALLMULTI)) {
+        ifr.ifr_flags |= IFF_ALLMULTI;
+        ioctl(sock, SIOCSIFFLAGS, &ifr);
+    }
+}
+
+static int get_wlan0_info(int ctl_sock, int *ifidx, unsigned char mac[6], unsigned char ip[4]) {
+    struct wifi_ifreq ifr;
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, "wlan0", WIFI_IFNAMSIZ - 1);
+    if (ioctl(ctl_sock, SIOCGIFINDEX, &ifr) < 0) return -1;
+    *ifidx = ifr.ifr_ifindex;
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, "wlan0", WIFI_IFNAMSIZ - 1);
+    if (ioctl(ctl_sock, SIOCGIFHWADDR, &ifr) < 0) return -1;
+    memcpy(mac, ifr.ifr_raw + 2, 6);
+    if ((mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5]) == 0) return -1;
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, "wlan0", WIFI_IFNAMSIZ - 1);
+    if (ioctl(ctl_sock, SIOCGIFADDR, &ifr) < 0) return -1;
+    memcpy(ip, ifr.ifr_raw + 4, 4);
+    if ((ip[0] | ip[1] | ip[2] | ip[3]) == 0) return -1;
+    return 0;
+}
+
+static void wait_for_wlan0_ip(int max_wait_sec) {
+    for (int elapsed = 0; elapsed < max_wait_sec; elapsed++) {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            int ifidx = 0;
+            unsigned char mac[6];
+            unsigned char ip[4];
+            int ok = get_wlan0_info(sock, &ifidx, mac, ip);
+            close(sock);
+            if (ok == 0) return;
+        }
+        sleep(1);
+    }
+}
+
+static void send_arp_frame(int ps, int ifidx,
+                           const unsigned char dst_mac[6],
+                           const unsigned char src_mac[6],
+                           const unsigned char src_ip[4],
+                           unsigned short op,
+                           const unsigned char tha[6],
+                           const unsigned char tpa[4]) {
+    struct sockaddr_ll sll;
+    unsigned char pkt[42];
+
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons_be16(ETH_P_ARP);
+    sll.sll_ifindex = ifidx;
+    sll.sll_halen = 6;
+    memcpy(sll.sll_addr, dst_mac, 6);
+
+    memcpy(pkt, dst_mac, 6);
+    memcpy(pkt + 6, src_mac, 6);
+    pkt[12] = 0x08; pkt[13] = 0x06; /* EtherType ARP */
+    pkt[14] = 0x00; pkt[15] = 0x01; /* HTYPE Ethernet */
+    pkt[16] = 0x08; pkt[17] = 0x00; /* PTYPE IPv4 */
+    pkt[18] = 6;    pkt[19] = 4;    /* HLEN 6, PLEN 4 */
+    pkt[20] = (unsigned char)((op >> 8) & 0xff);
+    pkt[21] = (unsigned char)(op & 0xff);
+    memcpy(pkt + 22, src_mac, 6);
+    memcpy(pkt + 28, src_ip, 4);
+    memcpy(pkt + 32, tha, 6);
+    memcpy(pkt + 38, tpa, 4);
+    sendto(ps, pkt, sizeof(pkt), 0, &sll, sizeof(sll));
+}
+
+static int parse_ipv4_token(const char *s, unsigned char out[4]) {
+    unsigned int val = 0;
+    int part = 0, digits = 0;
+    for (; *s && *s != ' ' && *s != '\t'; s++) {
+        if (*s >= '0' && *s <= '9') {
+            val = val * 10U + (unsigned int)(*s - '0');
+            if (val > 255U) return -1;
+            digits++;
+        } else if (*s == '.' && digits > 0 && part < 3) {
+            out[part++] = (unsigned char)val;
+            val = 0;
+            digits = 0;
+        } else {
+            return -1;
+        }
+    }
+    if (part != 3 || digits == 0) return -1;
+    out[3] = (unsigned char)val;
+    return 0;
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int parse_mac_token(const char *s, unsigned char out[6]) {
+    for (int i = 0; i < 6; i++) {
+        int hi = hex_nibble(s[i * 3]);
+        int lo = hex_nibble(s[i * 3 + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        if (i < 5 && s[i * 3 + 2] != ':') return -1;
+        out[i] = (unsigned char)((hi << 4) | lo);
+    }
+    return 0;
+}
+
+/* Broadcast Gratuitous ARP + unicast ARP Request to known peers.
+ * bcmdhd often drops inbound broadcast ARP requests on R1's wlan0;
+ * proactive outbound ARP requests keep client ARP caches fresh.
+ */
+static void refresh_wlan0_arp(int ifidx, const unsigned char my_mac[6], const unsigned char my_ip[4]) {
+    static const unsigned char bcast_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    static const unsigned char zero_mac[6] = {0, 0, 0, 0, 0, 0};
+
+    int ps = socket(AF_PACKET, SOCK_RAW, htons_be16(ETH_P_ARP));
+    if (ps < 0) return;
+
+    send_arp_frame(ps, ifidx, bcast_mac, my_mac, my_ip, 1, zero_mac, my_ip);
+    send_arp_frame(ps, ifidx, bcast_mac, my_mac, my_ip, 2, bcast_mac, my_ip);
+
+    int afd = open("/proc/net/arp", O_RDONLY);
+    if (afd >= 0) {
+        char buf[4096];
+        ssize_t n = read(afd, buf, sizeof(buf) - 1);
+        close(afd);
+        if (n > 0) {
+            buf[n] = '\0';
+            char *p = buf;
+            while (*p) {
+                char *line = p;
+                while (*p && *p != '\n') p++;
+                if (*p == '\n') *p++ = '\0';
+
+                unsigned char peer_ip[4];
+                if (parse_ipv4_token(line, peer_ip) != 0) continue;
+                if (peer_ip[0] == my_ip[0] && peer_ip[1] == my_ip[1] &&
+                    peer_ip[2] == my_ip[2] && peer_ip[3] == my_ip[3]) continue;
+
+                const char *cols[6] = {0, 0, 0, 0, 0, 0};
+                int col = 0;
+                char *q = line;
+                while (*q && col < 6) {
+                    while (*q == ' ' || *q == '\t') q++;
+                    if (!*q) break;
+                    cols[col++] = q;
+                    while (*q && *q != ' ' && *q != '\t') q++;
+                }
+                if (col < 6) continue;
+                if (strncmp(cols[5], "wlan0", 5) != 0) continue;
+                if (strncmp(cols[2], "0x0", 3) == 0 && (cols[2][3] == ' ' || cols[2][3] == '\t' || cols[2][3] == '\0')) {
+                    continue;
+                }
+                unsigned char peer_mac[6];
+                if (parse_mac_token(cols[3], peer_mac) != 0) continue;
+                if ((peer_mac[0] | peer_mac[1] | peer_mac[2] |
+                     peer_mac[3] | peer_mac[4] | peer_mac[5]) == 0) continue;
+
+                send_arp_frame(ps, ifidx, peer_mac, my_mac, my_ip, 1, zero_mac, peer_ip);
+            }
+        }
+    }
+    close(ps);
 }
 
 /* --- Bluetooth Discoverable Keepalive (Android Binder) --- */
@@ -862,24 +1116,41 @@ static void *wifi_keepalive_thread(void *arg) {
     while (1) {
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock >= 0) {
+            wlan0_ensure_allmulti(sock);
             if (tick % 10 == 0) {
                 wlan0_priv_cmd(sock, "SETSUSPENDMODE 0");
             }
             wlan0_priv_cmd(sock, "RXFILTER-STOP");
             wlan0_priv_cmd(sock, "PM 0");
+            wlan0_priv_cmd(sock, "BTCOEXMODE 2");
+            wlan0_wlc_set_pm(sock, 0);
+            wlan0_wlc_set_iovar(sock, "mpc", 0);
+            wlan0_wlc_set_iovar(sock, "arp_ol", 0);
+            wlan0_wlc_set_iovar(sock, "bcn_li_dtim", 1);
+            wlan0_wlc_set_iovar(sock, "bcn_li_bcn", 1);
+            wlan0_wlc_set_iovar(sock, "btc_mode", 2);
+            wlan0_wlc_set_iovar(sock, "allmulti", 1);
+
+            int ifidx = 0;
+            unsigned char my_mac[6];
+            unsigned char my_ip[4];
+            if (get_wlan0_info(sock, &ifidx, my_mac, my_ip) == 0) {
+                refresh_wlan0_arp(ifidx, my_mac, my_ip);
+            }
             close(sock);
         }
-        if (tick >= 1) {
+        if (tick >= 3 && (tick % 3 == 0)) {
             ensure_bt_discoverable();
         }
         tick++;
-        sleep(30);
+        sleep(10);
     }
     return NULL;
 }
 
 static void *nqptp_supervisor_thread(void *arg) {
     (void)arg;
+    wait_for_wlan0_ip(30);
     while (1) {
         if (access("/data/local/airplay2/nqptp", 0) == 0) {
             klog("<4>[r1_uac] Starting NQPTP PTP daemon...\n");
@@ -909,6 +1180,7 @@ static void *nqptp_supervisor_thread(void *arg) {
 
 static void *shairport_supervisor_thread(void *arg) {
     (void)arg;
+    wait_for_wlan0_ip(30);
     sleep(2); // Wait for NQPTP to bind ports 319/320 and initialize shared memory
     while (1) {
         if (access("/data/local/airplay2/shairport-sync", 0) == 0) {
@@ -1049,7 +1321,7 @@ static void run_uac1_bridge(void) {
             while (1) {
                 ssize_t n = read(ap2_pipe_fd, ap2_frame_buf + ap2_rem, sizeof(ap2_frame_buf) - 4 - ap2_rem);
                 if (n > 0) {
-                    last_airplay_activity = now;
+                    last_airplay_activity = time(NULL);
                     size_t total = ap2_rem + (size_t)n;
                     size_t valid = total & ~3; // Align to 4-byte stereo 16-bit frame
                     ap2_rem = total - valid;
@@ -1082,9 +1354,15 @@ static void run_uac1_bridge(void) {
                             }
                         }
                         if (s_pcm && s_active_rate == 48000 && !s_is_muted) {
-                            pcm_write(s_pcm, ap2_frame_buf, (unsigned int)valid);
+                            if (pcm_write(s_pcm, ap2_frame_buf, (unsigned int)valid) != 0) {
+                                klog("<3>[r1_uac] AirPlay 2 pcm_write failed, resetting PCM\n");
+                                pcm_close(s_pcm);
+                                s_pcm = NULL;
+                                s_active_rate = 0;
+                            }
                         }
                         pthread_mutex_unlock(&s_audio_lock);
+                        last_airplay_activity = time(NULL);
                     }
 
                     if (ap2_rem > 0) {
@@ -1103,7 +1381,8 @@ static void run_uac1_bridge(void) {
             }
         }
 
-        // Check AirPlay 2 idle timeout (1.5 seconds)
+        // Check AirPlay 2 idle timeout (2 seconds)
+        now = time(NULL);
         if (s_airplay_active && (now - last_airplay_activity >= 2)) {
             pthread_mutex_lock(&s_audio_lock);
             if (s_airplay_active) {
