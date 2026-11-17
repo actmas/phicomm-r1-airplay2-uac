@@ -147,6 +147,7 @@ echo "[*] 禁用斐讯 AI 语音、旧版播放器与蓝牙隐藏监控 (com.phi
 $ADB shell "su -c 'CLASSPATH=/system/framework/pm.jar app_process /system/bin com.android.commands.pm.Pm disable com.phicomm.speaker.device'" || true
 $ADB shell "su -c 'CLASSPATH=/system/framework/pm.jar app_process /system/bin com.android.commands.pm.Pm disable com.phicomm.speaker.player'" || true
 $ADB shell "su -c 'CLASSPATH=/system/framework/pm.jar app_process /system/bin com.android.commands.pm.Pm disable com.phicomm.speaker.systemtool'" || true
+$ADB shell "su -c 'CLASSPATH=/system/framework/pm.jar app_process /system/bin com.android.commands.pm.Pm disable com.phicomm.speaker.netctl'" || true
 $ADB shell "su -c 'settings put global wifi_suspend_optimizations_enabled 0'" || true
 
 echo "[*] 部署 AirPlay 2 守护进程与配置至 /data/local/airplay2/..."

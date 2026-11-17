@@ -415,11 +415,35 @@ static void hsv_to_rgb(int h, int v, int *r, int *g, int *b) {
     }
 }
 
+static void cancel_led_effects(void) {
+    static const char close_leds0[] =
+        "100 1 1 1 000000 000000 100 0 15 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15";
+    static const char close_leds1[] =
+        "100 1 1 1 000000 000000 100 0 24 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39";
+    int fd = open("/sys/class/leds/multi_leds0/color", O_WRONLY);
+    if (fd >= 0) {
+        write(fd, close_leds0, sizeof(close_leds0) - 1);
+        close(fd);
+    }
+    fd = open("/sys/class/leds/multi_leds1/color", O_WRONLY);
+    if (fd >= 0) {
+        write(fd, close_leds1, sizeof(close_leds1) - 1);
+        close(fd);
+    }
+}
+
 static void write_led_color(int r, int g, int b) {
     static int last_r = -1, last_g = -1, last_b = -1;
+    static int off_refresh = 0;
     if (r == 0 && g == 0 && b == 0) {
-        if (last_r == 0 && last_g == 0 && last_b == 0) return;
+        if (last_r == 0 && last_g == 0 && last_b == 0) {
+            if (++off_refresh < 4) return;
+        } else {
+            cancel_led_effects();
+        }
+        off_refresh = 0;
     } else if (last_r >= 0) {
+        off_refresh = 0;
         int dr = r - last_r; if (dr < 0) dr = -dr;
         int dg = g - last_g; if (dg < 0) dg = -dg;
         int db = b - last_b; if (db < 0) db = -db;
@@ -518,7 +542,21 @@ static int update_playback_light(int is_playing) {
 /* Dedicated ambient light worker thread (completely isolated from ALSA playback) */
 static void *ambient_light_thread(void *arg) {
     (void)arg;
+    unsigned int led_tick = 0;
     while (1) {
+        if (led_tick % 40 == 0) {
+            /* Restrict LED sysfs nodes to root so stock Phicomm services cannot overwrite idle LEDs */
+            chmod("/sys/class/leds/multi_leds0/led_color", 0600);
+            chmod("/sys/class/leds/multi_leds0/color", 0600);
+            chmod("/sys/class/leds/multi_leds0/brightness", 0600);
+            chmod("/sys/class/leds/multi_leds1/led_color", 0600);
+            chmod("/sys/class/leds/multi_leds1/color", 0600);
+            chmod("/sys/class/leds/multi_leds1/brightness", 0600);
+            if (led_tick <= 80) {
+                cancel_led_effects();
+            }
+        }
+        led_tick++;
         int has_pcm_audio = 0;
         if (s_airplay_active || s_usb_playing) {
             unsigned long now = get_monotonic_ms();
